@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# opencode-serve — start OpenCode's headless server, auto-bound to the tailnet.
+#
+# This wrapper is the single source of truth for host/port/secret resolution and
+# is invoked identically by the systemd unit (Linux) and the launchd plist
+# (macOS). Binding is resolved at *every* start, so the server always follows the
+# node's current Tailscale IP with no hardcoded address.
+#
+# Overridable via environment:
+#   OPENCODE_SERVE_HOST   force a bind host (skips tailnet detection)
+#   OPENCODE_SERVE_PORT   listen port (default 4096)
+#   OPENCODE_SERVE_DIR    secrets dir (default ~/.opencode-serve)
+set -euo pipefail
+
+SERVE_DIR="${OPENCODE_SERVE_DIR:-$HOME/.opencode-serve}"
+ENV_FILE="$SERVE_DIR/env"
+TOKEN_FILE="$SERVE_DIR/token"
+PORT="${OPENCODE_SERVE_PORT:-4096}"
+
+log() { printf '[opencode-serve] %s\n' "$*" >&2; }
+
+# --- bind host: explicit override > tailscale ip > interface scan > loopback ---
+resolve_host() {
+  if [ -n "${OPENCODE_SERVE_HOST:-}" ]; then
+    printf '%s' "$OPENCODE_SERVE_HOST"
+    return
+  fi
+  if command -v tailscale >/dev/null 2>&1; then
+    local ip
+    ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+    if [ -n "$ip" ]; then printf '%s' "$ip"; return; fi
+  fi
+  local scanned
+  scanned="$(scan_tailnet_ip || true)"
+  if [ -n "$scanned" ]; then printf '%s' "$scanned"; return; fi
+  log "WARNING: no tailnet IP found; binding to 127.0.0.1"
+  printf '127.0.0.1'
+}
+
+# Fallback when the tailscale CLI is unavailable: find a CGNAT/tailnet address
+# (100.64.0.0/10). Works on Linux (ip) and macOS (ifconfig).
+scan_tailnet_ip() {
+  { if command -v ip >/dev/null 2>&1; then
+      ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    else
+      ifconfig 2>/dev/null | awk '/inet /{print $2}'
+    fi
+  } | awk -F. '$1==100 && $2>=64 && $2<=127 {print; exit}'
+}
+
+# --- secrets: generate once, mode 600, base64url (URL-safe) --------------------
+rand_secret() { openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'; }
+
+ensure_secrets() {
+  mkdir -p "$SERVE_DIR"
+  chmod 700 "$SERVE_DIR" 2>/dev/null || true
+  if [ ! -f "$ENV_FILE" ]; then
+    ( umask 177; printf 'OPENCODE_SERVER_PASSWORD=%s\n' "$(rand_secret)" > "$ENV_FILE" )
+    log "generated $ENV_FILE"
+  fi
+  if [ ! -f "$TOKEN_FILE" ]; then
+    ( umask 177; rand_secret > "$TOKEN_FILE" )
+    log "generated $TOKEN_FILE"
+  fi
+}
+
+# --- locate the opencode binary across common install prefixes -----------------
+find_opencode() {
+  if command -v opencode >/dev/null 2>&1; then command -v opencode; return; fi
+  local p
+  for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" \
+           /usr/local/bin/opencode /opt/homebrew/bin/opencode; do
+    if [ -x "$p" ]; then printf '%s' "$p"; return; fi
+  done
+  log "ERROR: opencode binary not found on PATH or in known prefixes"
+  exit 127
+}
+
+# Optional: pull in codebox-managed tokens if present (harmless when absent).
+if [ -f "$HOME/.config/codebox/env.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.config/codebox/env.sh" || true
+fi
+
+ensure_secrets
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+export OPENCODE_DISABLE_CHANNEL_DB="${OPENCODE_DISABLE_CHANNEL_DB:-1}"
+
+HOST="$(resolve_host)"
+BIN="$(find_opencode)"
+log "binding ${HOST}:${PORT} via ${BIN}"
+exec "$BIN" serve --hostname "$HOST" --port "$PORT"

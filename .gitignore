@@ -1,0 +1,3 @@
+# local secrets, never commit
+.opencode-serve/
+*.log
