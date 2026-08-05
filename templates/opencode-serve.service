@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=%h
 ExecStart=__WRAPPER__
 Restart=always
 RestartSec=2

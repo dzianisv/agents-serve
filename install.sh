@@ -63,6 +63,13 @@ install_linux() {
   local log="$HOME/.cache/opencode-serve/serve.log"
   mkdir -p "$(dirname "$unit")" "$(dirname "$log")"
 
+  # This installer owns opencode-serve.service. Clear stale drop-ins from prior
+  # tooling so a previous WorkingDirectory/Environment override can't break us.
+  if [ -d "$unit.d" ]; then
+    warn "removing stale drop-ins in $unit.d"
+    rm -rf "$unit.d"
+  fi
+
   fetch "templates/opencode-serve.service" \
     | sed -e "s|__WRAPPER__|$WRAPPER|g" -e "s|__LOG__|$log|g" > "$unit"
   say "unit installed -> $unit"
