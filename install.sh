@@ -81,7 +81,9 @@ install_linux() {
   fi
 
   systemctl --user daemon-reload
-  systemctl --user enable --now opencode-serve.service
+  systemctl --user reset-failed opencode-serve.service 2>/dev/null || true
+  systemctl --user enable opencode-serve.service
+  systemctl --user restart opencode-serve.service
   loginctl enable-linger "$USER" >/dev/null 2>&1 || true
   say "service started (systemd --user)"
 }
