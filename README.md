@@ -1,14 +1,14 @@
 # opencode-serve
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/dzianisv/opencode-serve/main/install.sh | bash
+```
+
 One-line installer that runs [OpenCode](https://opencode.ai)'s headless server as
 a background service, **auto-bound to your Tailscale tailnet IP** — no hardcoded
 address. Unix-agnostic: **systemd** on Linux, **launchd** on macOS.
 
 ## Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dzianisv/opencode-serve/main/install.sh | bash
-```
 
 The installer:
 
