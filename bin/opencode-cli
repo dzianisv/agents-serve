@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# opencode-cli - list sessions and optionally auto-approve permission requests
+# from a remote OpenCode server.
+set -euo pipefail
+
+REMOTE=""
+AUTOAPPROVE=0
+RECONNECT_DELAY="${OPENCODE_CLI_RECONNECT_DELAY:-2}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  opencode-cli --remote http://user:password@hostname:port
+  opencode-cli --remote http://user:password@hostname:port --autoapprove
+
+Options:
+  --remote URL     OpenCode server URL, including HTTP basic-auth credentials
+  --autoapprove    Keep listening and answer permission requests with "always"
+  -h, --help       Show this help
+
+Environment:
+  OPENCODE_CLI_RECONNECT_DELAY  Seconds between event-stream reconnects (default: 2)
+EOF
+}
+
+die() {
+  printf '[opencode-cli] error: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '[opencode-cli] %s\n' "$*" >&2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' is required"
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --remote)
+        [ "$#" -ge 2 ] || die "--remote requires a URL"
+        REMOTE="$2"
+        shift 2
+        ;;
+      --autoapprove)
+        AUTOAPPROVE=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument '$1' (use --help for usage)"
+        ;;
+    esac
+  done
+
+  [ -n "$REMOTE" ] || die "--remote is required"
+  case "$REMOTE" in
+    http://*|https://*) ;;
+    *) die "--remote must be an http:// or https:// URL" ;;
+  esac
+  REMOTE="${REMOTE%/}"
+}
+
+urlencode() {
+  printf '%s' "$1" | jq -sRr @uri
+}
+
+list_sessions() {
+  local sessions
+  if ! sessions="$(curl --silent --show-error --fail --connect-timeout 10 \
+    "$REMOTE/session")"; then
+    die "could not list sessions from the remote server"
+  fi
+
+  printf '%s\n' "$sessions" | jq -r '
+    def updated:
+      if (.time.updated | type) == "number"
+      then (.time.updated / 1000 | strftime("%Y-%m-%d %H:%M:%S"))
+      else (.time.updated // "")
+      end;
+    ( ["ID", "UPDATED", "TITLE", "DIRECTORY"] | @tsv ),
+    (.[] | [(.id // ""), updated, (.title // ""), (.directory // "")] | @tsv)
+  ' | if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi
+}
+
+permission_from_event() {
+  jq -c '
+    def event:
+      if .type? then .
+      elif .payload?.type? then .payload
+      elif .data?.type? then .data
+      else empty
+      end;
+    event as $event |
+      if ($event.type == "permission.updated" or
+          $event.type == "permission.asked" or
+          $event.type == "permission.v2.asked")
+      then ($event.properties // $event.data // $event)
+      else empty
+      end
+  ' 2>/dev/null
+}
+
+approve_permission() {
+  local permission="$1"
+  local session_id permission_id title encoded_session encoded_permission
+
+  session_id="$(printf '%s' "$permission" | jq -r '.sessionID // empty')"
+  permission_id="$(printf '%s' "$permission" | jq -r '.id // empty')"
+  title="$(printf '%s' "$permission" | jq -r '.title // .permission // .type // "permission request"')"
+
+  if [ -z "$session_id" ] || [ -z "$permission_id" ]; then
+    log "ignored permission event without sessionID or id"
+    return 0
+  fi
+
+  encoded_session="$(urlencode "$session_id")"
+  encoded_permission="$(urlencode "$permission_id")"
+  if curl --silent --show-error --fail --connect-timeout 10 \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"response":"always"}' \
+    "$REMOTE/session/$encoded_session/permissions/$encoded_permission" >/dev/null 2>&1; then
+    log "approved $title for session $session_id"
+  elif curl --silent --show-error --fail --connect-timeout 10 \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"reply":"always"}' \
+    "$REMOTE/permission/$encoded_permission/reply" >/dev/null 2>&1; then
+    log "approved $title for session $session_id"
+  else
+    log "failed to approve $title for session $session_id"
+  fi
+}
+
+approve_pending_permissions() {
+  local pending
+
+  for endpoint in "$REMOTE/permission" "$REMOTE/api/permission/request"; do
+    pending="$(curl --silent --show-error --fail --connect-timeout 10 \
+      "$endpoint" 2>/dev/null || true)"
+    [ -n "$pending" ] || continue
+    while IFS= read -r permission; do
+      [ -n "$permission" ] || continue
+      approve_permission "$permission"
+    done < <(printf '%s' "$pending" | jq -c '
+    if type == "array" then .[]
+    elif (.data | type) == "array" then .data[]
+    else empty
+    end
+    ' 2>/dev/null)
+  done
+}
+
+consume_events() {
+  local line data permission
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      data:*)
+        data="${line#data:}"
+        data="${data# }"
+        [ -n "$data" ] || continue
+        permission="$(printf '%s' "$data" | permission_from_event || true)"
+        [ -n "$permission" ] || continue
+        approve_permission "$permission"
+        ;;
+    esac
+  done
+}
+
+autoapprove_loop() {
+  log "listening for permission requests on the remote server"
+  while :; do
+    if curl --silent --show-error --fail --no-buffer --connect-timeout 10 \
+      "$REMOTE/event" | consume_events; then
+      log "event stream disconnected; reconnecting in ${RECONNECT_DELAY}s"
+    else
+      log "event stream failed; reconnecting in ${RECONNECT_DELAY}s"
+    fi
+    sleep "$RECONNECT_DELAY"
+  done
+}
+
+main() {
+  parse_args "$@"
+  require_command curl
+  require_command jq
+
+  if [ "$AUTOAPPROVE" -eq 1 ]; then
+    # Start listening before listing so a request raised during the initial
+    # session fetch is not missed.
+    autoapprove_loop &
+    local event_pid=$!
+    trap 'kill "$event_pid" 2>/dev/null || true; wait "$event_pid" 2>/dev/null || true' EXIT INT TERM
+    list_sessions
+    approve_pending_permissions
+    log 'auto-approve is active; press Ctrl-C to stop'
+    wait "$event_pid"
+  else
+    list_sessions
+  fi
+}
+
+main "$@"

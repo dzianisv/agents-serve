@@ -14,7 +14,7 @@ The installer:
 
 1. Installs the `opencode` binary if missing (`@vibetechnologies/opencode` via
    npm, else the upstream installer).
-2. Drops the `opencode-serve` wrapper into `~/.local/bin`.
+2. Drops the `opencode-serve` wrapper and `opencode-cli` remote client into `~/.local/bin`.
 3. Generates a random server password + token in `~/.opencode-serve/` (mode 600),
    only if they don't already exist.
 4. Installs and starts the service:
@@ -81,6 +81,26 @@ journalctl --user -u opencode-serve -f      # or ~/.cache/opencode-serve/serve.l
 tail -f ~/Library/Logs/opencode-serve.log
 ```
 
+## Remote CLI
+
+List sessions on a running server:
+
+```bash
+opencode-cli --remote 'http://opencode:password@hostname:4096'
+```
+
+Keep listening for permission requests and approve them with OpenCode's
+`always` response:
+
+```bash
+opencode-cli --remote 'http://opencode:password@hostname:4096' --autoapprove
+```
+
+The URL must include the server's HTTP basic-auth credentials. `--autoapprove`
+is intentionally opt-in and keeps running until interrupted. Use HTTPS when
+the connection leaves a trusted private network. The client requires `curl` and
+`jq` on the client machine.
+
 ## Uninstall
 
 ```bash
@@ -96,6 +116,7 @@ opencode-serve/
 ├── install.sh                       # entry point (Linux + macOS)
 ├── uninstall.sh
 ├── bin/opencode-serve               # wrapper: tailnet bind + secrets + exec opencode serve
+├── bin/opencode-cli                 # remote session lister + permission listener
 └── templates/
     ├── opencode-serve.service       # systemd --user unit
     └── com.opencode.serve.plist     # launchd LaunchAgent

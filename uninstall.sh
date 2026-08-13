@@ -6,6 +6,7 @@ set -euo pipefail
 OS="$(uname -s)"
 PURGE="${1:-}"
 WRAPPER="${PREFIX:-$HOME/.local}/bin/opencode-serve"
+CLI="${PREFIX:-$HOME/.local}/bin/opencode-cli"
 
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 
@@ -28,6 +29,7 @@ case "$OS" in
 esac
 
 rm -f "$WRAPPER" && say "removed wrapper $WRAPPER"
+rm -f "$CLI" && say "removed CLI $CLI"
 
 if [ "$PURGE" = "--purge" ]; then
   rm -rf "$HOME/.opencode-serve"

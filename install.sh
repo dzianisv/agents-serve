@@ -18,6 +18,7 @@ REPO_RAW="${OPENCODE_SERVE_RAW:-https://raw.githubusercontent.com/dzianisv/openc
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 WRAPPER="$BIN_DIR/opencode-serve"
+CLI="$BIN_DIR/opencode-cli"
 PORT="${OPENCODE_SERVE_PORT:-4096}"
 OS="$(uname -s)"
 
@@ -56,6 +57,10 @@ install_wrapper() {
   fetch "bin/opencode-serve" > "$WRAPPER"
   chmod +x "$WRAPPER"
   say "wrapper installed -> $WRAPPER"
+
+  fetch "bin/opencode-cli" > "$CLI"
+  chmod +x "$CLI"
+  say "CLI installed -> $CLI"
 }
 
 install_linux() {
