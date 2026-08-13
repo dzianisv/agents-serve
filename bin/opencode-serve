@@ -10,6 +10,7 @@
 #   OPENCODE_SERVE_HOST   force a bind host (skips tailnet detection)
 #   OPENCODE_SERVE_PORT   listen port (default 4096)
 #   OPENCODE_SERVE_DIR    secrets dir (default ~/.opencode-serve)
+#   OPENCODE_PERMISSION   JSON permission policy (default: allow all)
 set -euo pipefail
 
 SERVE_DIR="${OPENCODE_SERVE_DIR:-$HOME/.opencode-serve}"
@@ -89,6 +90,9 @@ set -a
 set +a
 
 export OPENCODE_DISABLE_CHANNEL_DB="${OPENCODE_DISABLE_CHANNEL_DB:-1}"
+# The serve command has no --autoso flag. Configure the server's supported
+# permission policy instead, while allowing callers to provide a stricter one.
+export OPENCODE_PERMISSION="${OPENCODE_PERMISSION:-{\"*\":\"allow\"}}"
 
 HOST="$(resolve_host)"
 BIN="$(find_opencode)"

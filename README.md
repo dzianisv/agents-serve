@@ -47,6 +47,12 @@ launchctl kickstart -k gui/$(id -u)/com.opencode.serve
 | `OPENCODE_SERVE_HOST`   | auto (tailnet IP)  | Force a specific bind host       |
 | `OPENCODE_SERVE_PORT`   | `4096`             | Listen port                      |
 | `OPENCODE_SERVE_DIR`    | `~/.opencode-serve`| Secrets directory                |
+| `OPENCODE_PERMISSION`   | `{"*":"allow"}`  | Permission policy for headless mode |
+
+The wrapper configures OpenCode's supported permission policy so the headless
+agent does not stop for approval prompts. This is equivalent to an auto-approve
+mode; `opencode serve` does not support a `--autoso` flag. Set
+`OPENCODE_PERMISSION` to a stricter JSON policy when needed.
 
 Set persistently for the service:
 
