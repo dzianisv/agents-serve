@@ -19,6 +19,7 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 WRAPPER="$BIN_DIR/opencode-serve"
 CLI="$BIN_DIR/opencode-cli"
+OFFLOAD="$BIN_DIR/opencode-session-offload"
 PORT="${OPENCODE_SERVE_PORT:-4096}"
 OS="$(uname -s)"
 
@@ -61,6 +62,10 @@ install_wrapper() {
   fetch "bin/opencode-cli" > "$CLI"
   chmod +x "$CLI"
   say "CLI installed -> $CLI"
+
+  fetch "bin/opencode-session-offload" > "$OFFLOAD"
+  chmod +x "$OFFLOAD"
+  say "session offload installed -> $OFFLOAD"
 }
 
 install_linux() {
