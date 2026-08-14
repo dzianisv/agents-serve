@@ -101,6 +101,20 @@ is intentionally opt-in and keeps running until interrupted. Use HTTPS when
 the connection leaves a trusted private network. The client requires `curl` and
 `jq` on the client machine.
 
+## Session offload
+
+Archive and remove sessions inactive for seven days. The command prints archive
+bytes, database size, and reusable SQLite space:
+
+```bash
+OPENCODE_DISABLE_CHANNEL_DB=1 opencode-session-offload \
+  --export /Volumes/archive/opencode/sessions \
+  --older-than 7 \
+  --delete
+```
+
+Add `--vacuum` only after stopping every OpenCode process using the database.
+
 ## Uninstall
 
 ```bash
@@ -117,6 +131,7 @@ opencode-serve/
 ├── uninstall.sh
 ├── bin/opencode-serve               # wrapper: tailnet bind + secrets + exec opencode serve
 ├── bin/opencode-cli                 # remote session lister + permission listener
+├── bin/opencode-session-offload     # local session archive wrapper
 └── templates/
     ├── opencode-serve.service       # systemd --user unit
     └── com.opencode.serve.plist     # launchd LaunchAgent
