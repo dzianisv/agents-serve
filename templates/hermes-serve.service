@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes AI agent server (tailnet-bound)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=__WRAPPER__
+Restart=always
+RestartSec=2
+StandardOutput=append:__LOG__
+StandardError=append:__LOG__
+
+[Install]
+WantedBy=default.target

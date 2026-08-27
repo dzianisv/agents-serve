@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# hermes-serve — start the Hermes agent server, auto-bound to the tailnet.
+#
+# Same idiom as opencode-serve/paperclip-serve: resolve the bind host at
+# every start so the service follows the node's current Tailscale IP.
+#
+# NOTE: as of the June 2026 Hermes hardening, binding to any non-loopback
+# host REQUIRES an auth provider to be configured (password or OAuth) —
+# `--insecure` is a deprecated no-op. If auth isn't configured, `hermes serve`
+# will refuse to start on a tailnet address; run `hermes dashboard register`
+# (or configure OAuth) before relying on this service. See README.md.
+#
+# Overridable via environment:
+#   HERMES_SERVE_HOST   force a bind host (skips tailnet detection)
+#   AGENTS_SERVE_HOST   generic bind-host override, used if the per-service
+#                       override above is unset
+#   HERMES_SERVE_PORT   listen port (default 9119)
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck disable=SC2034 # consumed by log() once lib/tailnet.sh is sourced below
+LOG_TAG="hermes-serve"
+
+# shellcheck source=../lib/tailnet.sh
+if [ -f "$SELF_DIR/../lib/tailnet.sh" ]; then
+  . "$SELF_DIR/../lib/tailnet.sh"
+else
+  . "${PREFIX:-$HOME/.local}/lib/agents-serve/tailnet.sh"
+fi
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
+
+PORT="${HERMES_SERVE_PORT:-9119}"
+
+# --- locate the hermes binary: PATH shim > ~/.local/bin > the real venv ------
+# entrypoint. ~/.local/bin/hermes is typically a shell shim that unsets
+# PYTHONPATH/PYTHONHOME and execs the venv binary below, so prefer it first,
+# then fall back to the venv binary directly if the shim is missing.
+find_hermes() {
+  if command -v hermes >/dev/null 2>&1; then command -v hermes; return; fi
+  local p
+  for p in "$HOME/.local/bin/hermes" "$HOME/.hermes/hermes-agent/venv/bin/hermes"; do
+    if [ -x "$p" ]; then printf '%s' "$p"; return; fi
+  done
+  log "ERROR: hermes binary not found on PATH or in known prefixes"
+  exit 127
+}
+
+HOST="$(resolve_host "${HERMES_SERVE_HOST:-}")"
+BIN="$(find_hermes)"
+log "binding ${HOST}:${PORT} via ${BIN}"
+exec "$BIN" serve --host "$HOST" --port "$PORT" --skip-build

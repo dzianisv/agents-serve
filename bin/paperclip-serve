@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# paperclip-serve — start the paperclipai agent server, auto-bound to the tailnet.
+#
+# Same idiom as opencode-serve: resolve bind host at every start so the
+# service follows the node's current Tailscale IP.
+#
+# *** Why this wrapper exists ***
+# Paperclip's config supports `server.bind=tailnet`, but at server runtime it
+# resolves the tailnet address ONLY from the PAPERCLIP_TAILNET_BIND_HOST env
+# var — its auto-detection helper shells out to a bare `tailscale` on PATH,
+# and that auto-detect path is not used when the server actually starts.
+# Under launchd/systemd the PATH is minimal, so `tailscale` isn't found and
+# the server crash-loops with:
+#   "Paperclip server failed to start. server.bind=tailnet requires a
+#    detected Tailscale address or PAPERCLIP_TAILNET_BIND_HOST"
+# So this wrapper resolves the tailnet IP itself (via lib/tailnet.sh, same
+# logic opencode-serve/hermes-serve use) and exports PAPERCLIP_BIND=tailnet +
+# PAPERCLIP_TAILNET_BIND_HOST=<resolved ip> before exec'ing. If no tailnet IP
+# is found, it falls back to PAPERCLIP_BIND=loopback and leaves
+# PAPERCLIP_TAILNET_BIND_HOST unset — setting a loopback host there makes the
+# server refuse to start.
+#
+# Overridable via environment:
+#   PAPERCLIP_SERVE_HOST    force a bind host (skips tailnet detection)
+#   AGENTS_SERVE_HOST       generic bind-host override, used if the
+#                           per-service override above is unset
+#   PAPERCLIP_SERVE_PORT    listen port (default 3100), maps to paperclip's PORT
+#   PAPERCLIP_HOME          paperclip data dir (default ~/.paperclip)
+#   PAPERCLIP_INSTANCE_ID   instance name (default "default")
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck disable=SC2034 # consumed by log() once lib/tailnet.sh is sourced below
+LOG_TAG="paperclip-serve"
+
+# shellcheck source=../lib/tailnet.sh
+if [ -f "$SELF_DIR/../lib/tailnet.sh" ]; then
+  . "$SELF_DIR/../lib/tailnet.sh"
+else
+  . "${PREFIX:-$HOME/.local}/lib/agents-serve/tailnet.sh"
+fi
+
+# Widen PATH so tailscale/npm/paperclipai installed via Homebrew or
+# ~/.local/bin are found even under a minimal launchd/systemd PATH.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
+
+# --- locate the paperclipai binary across common install prefixes ------------
+find_paperclip() {
+  if command -v paperclipai >/dev/null 2>&1; then command -v paperclipai; return; fi
+  local p
+  for p in "$HOME/.local/bin/paperclipai" /usr/local/bin/paperclipai \
+           /opt/homebrew/bin/paperclipai; do
+    if [ -x "$p" ]; then printf '%s' "$p"; return; fi
+  done
+  log "ERROR: paperclipai binary not found on PATH or in known prefixes"
+  exit 127
+}
+
+export PAPERCLIP_HOME="${PAPERCLIP_HOME:-$HOME/.paperclip}"
+export PAPERCLIP_SERVICE_MANAGED=1
+export PAPERCLIP_INSTANCE_ID="${PAPERCLIP_INSTANCE_ID:-default}"
+export PORT="${PAPERCLIP_SERVE_PORT:-3100}"
+
+HOST="$(resolve_host "${PAPERCLIP_SERVE_HOST:-}")"
+if [ "$HOST" = "127.0.0.1" ]; then
+  # No tailnet address available — bind loopback only. Setting
+  # PAPERCLIP_TAILNET_BIND_HOST here would make the server refuse to start.
+  export PAPERCLIP_BIND=loopback
+  unset PAPERCLIP_TAILNET_BIND_HOST
+else
+  export PAPERCLIP_BIND=tailnet
+  export PAPERCLIP_TAILNET_BIND_HOST="$HOST"
+fi
+
+BIN="$(find_paperclip)"
+log "binding ${HOST}:${PORT} (PAPERCLIP_BIND=${PAPERCLIP_BIND}) via ${BIN}"
+exec "$BIN" run --instance "$PAPERCLIP_INSTANCE_ID"
