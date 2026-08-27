@@ -16,17 +16,36 @@
 # So this wrapper resolves the tailnet IP itself (via lib/tailnet.sh, same
 # logic opencode-serve/hermes-serve use) and exports PAPERCLIP_BIND=tailnet +
 # PAPERCLIP_TAILNET_BIND_HOST=<resolved ip> before exec'ing. If no tailnet IP
-# is found, it falls back to PAPERCLIP_BIND=loopback and leaves
-# PAPERCLIP_TAILNET_BIND_HOST unset — setting a loopback host there makes the
-# server refuse to start.
+# is found, it falls back to letting paperclip use its own default (loopback,
+# local_trusted) and leaves PAPERCLIP_BIND/PAPERCLIP_TAILNET_BIND_HOST unset.
+#
+# *** deploymentMode gotcha ***
+# PAPERCLIP_BIND (and PAPERCLIP_BIND_HOST/HOST) is silently IGNORED unless
+# deploymentMode is "authenticated" — the server's env loader defaults
+# deploymentMode to "local_trusted", and local_trusted always forces
+# bind=loopback, adding PAPERCLIP_BIND to its "ignored env keys" list when
+# it's set. So a tailnet bind requires ALSO setting
+# PAPERCLIP_DEPLOYMENT_MODE=authenticated (+ exposure=private, since
+# authenticated+public rejects bind=tailnet outright). Do not drop this when
+# "simplifying" the tailnet branch below — without it PAPERCLIP_BIND=tailnet
+# is a silent no-op and the server binds loopback while looking like it
+# started fine.
+#
+# authenticated mode in turn requires PAPERCLIP_AGENT_JWT_SECRET (see
+# `paperclipai doctor`'s required-env list), which we generate once and
+# persist locally, same idiom as opencode-serve's ensure_secrets().
 #
 # Overridable via environment:
-#   PAPERCLIP_SERVE_HOST    force a bind host (skips tailnet detection)
-#   AGENTS_SERVE_HOST       generic bind-host override, used if the
-#                           per-service override above is unset
-#   PAPERCLIP_SERVE_PORT    listen port (default 3100), maps to paperclip's PORT
-#   PAPERCLIP_HOME          paperclip data dir (default ~/.paperclip)
-#   PAPERCLIP_INSTANCE_ID   instance name (default "default")
+#   PAPERCLIP_SERVE_HOST         force a bind host (skips tailnet detection)
+#   AGENTS_SERVE_HOST            generic bind-host override, used if the
+#                                per-service override above is unset
+#   PAPERCLIP_SERVE_PORT         listen port (default 3100), maps to paperclip's PORT
+#   PAPERCLIP_HOME               paperclip data dir (default ~/.paperclip)
+#   PAPERCLIP_INSTANCE_ID        instance name (default "default")
+#   PAPERCLIP_SERVE_DIR          secrets dir (default ~/.paperclip-serve)
+#   PAPERCLIP_DEPLOYMENT_MODE    deployment mode when tailnet-bound (default authenticated)
+#   PAPERCLIP_DEPLOYMENT_EXPOSURE deployment exposure when tailnet-bound (default private)
+#   PAPERCLIP_AGENT_JWT_SECRET   auth secret (default: auto-generated + persisted)
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -56,22 +75,52 @@ find_paperclip() {
   exit 127
 }
 
+# --- secrets: generate once, mode 600 (mirrors opencode-serve's idiom) -------
+SERVE_DIR="${PAPERCLIP_SERVE_DIR:-$HOME/.paperclip-serve}"
+ENV_FILE="$SERVE_DIR/env"
+
+ensure_secrets() {
+  mkdir -p "$SERVE_DIR"
+  chmod 700 "$SERVE_DIR" 2>/dev/null || true
+  if [ ! -f "$ENV_FILE" ]; then
+    ( umask 177; printf 'PAPERCLIP_AGENT_JWT_SECRET=%s\n' "$(rand_secret)" > "$ENV_FILE" )
+    log "generated $ENV_FILE"
+  fi
+}
+
 export PAPERCLIP_HOME="${PAPERCLIP_HOME:-$HOME/.paperclip}"
 export PAPERCLIP_SERVICE_MANAGED=1
 export PAPERCLIP_INSTANCE_ID="${PAPERCLIP_INSTANCE_ID:-default}"
 export PORT="${PAPERCLIP_SERVE_PORT:-3100}"
 
+# An operator-supplied secret always wins; only fall back to our
+# generated/persisted one when the environment doesn't already have it.
+if [ -z "${PAPERCLIP_AGENT_JWT_SECRET:-}" ]; then
+  ensure_secrets
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
 HOST="$(resolve_host "${PAPERCLIP_SERVE_HOST:-}")"
 if [ "$HOST" = "127.0.0.1" ]; then
-  # No tailnet address available — bind loopback only. Setting
-  # PAPERCLIP_TAILNET_BIND_HOST here would make the server refuse to start.
-  export PAPERCLIP_BIND=loopback
-  unset PAPERCLIP_TAILNET_BIND_HOST
+  # No tailnet address available. Leave PAPERCLIP_BIND/deploymentMode alone
+  # so paperclip uses its own default (loopback, local_trusted) — do NOT set
+  # PAPERCLIP_BIND here: under local_trusted it would just land in the
+  # server's "ignored env keys" list (see the deploymentMode gotcha above).
+  :
 else
+  # Tailnet bind requires deploymentMode=authenticated (local_trusted forces
+  # loopback and ignores PAPERCLIP_BIND entirely); exposure=private is the
+  # only exposure that permits bind=tailnet under authenticated mode.
+  # Respect a caller-supplied value, only default it here.
+  export PAPERCLIP_DEPLOYMENT_MODE="${PAPERCLIP_DEPLOYMENT_MODE:-authenticated}"
+  export PAPERCLIP_DEPLOYMENT_EXPOSURE="${PAPERCLIP_DEPLOYMENT_EXPOSURE:-private}"
   export PAPERCLIP_BIND=tailnet
   export PAPERCLIP_TAILNET_BIND_HOST="$HOST"
 fi
 
 BIN="$(find_paperclip)"
-log "binding ${HOST}:${PORT} (PAPERCLIP_BIND=${PAPERCLIP_BIND}) via ${BIN}"
+log "binding ${HOST}:${PORT} (PAPERCLIP_BIND=${PAPERCLIP_BIND:-default} deploymentMode=${PAPERCLIP_DEPLOYMENT_MODE:-default}) via ${BIN}"
 exec "$BIN" run --instance "$PAPERCLIP_INSTANCE_ID"

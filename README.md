@@ -14,7 +14,7 @@ default; pass names to install a subset.
 | Service     | What it is                                   | Default port | Upstream install                                                                    | Auth notes |
 | ----------- | --------------------------------------------- | ------------- | ------------------------------------------------------------------------------------ | ---------- |
 | `opencode`  | [OpenCode](https://opencode.ai) headless server | `4096`        | `@vibetechnologies/opencode` via npm, else `curl -fsSL https://opencode.ai/install \| bash` | Server password + token, generated locally |
-| `paperclip` | [Paperclip](https://paperclip.ing) AI agent server | `3100`        | `curl -fsSL https://paperclip.ing/install.sh \| bash -s -- --no-prompt --no-onboard`   | No auth managed by this repo — see its own config |
+| `paperclip` | [Paperclip](https://paperclip.ing) AI agent server | `3100`        | `curl -fsSL https://paperclip.ing/install.sh \| bash -s -- --no-prompt --no-onboard`   | Tailnet bind forces `authenticated`+`private` mode; JWT secret auto-generated locally |
 | `hermes`    | [Hermes](https://github.com/NousResearch/hermes-agent) AI agent server | `9119`        | `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash` | **Requires auth configured** for non-loopback binds (see below) |
 
 Each installed service is reachable at `http://<tailnet-ip>:<port>` once the
@@ -88,9 +88,23 @@ Tailscale address or PAPERCLIP_TAILNET_BIND_HOST
 `paperclip-serve` works around this: it resolves the tailnet IP itself (same
 logic as the other wrappers) and exports `PAPERCLIP_BIND=tailnet` +
 `PAPERCLIP_TAILNET_BIND_HOST=<resolved ip>` before exec'ing. If no tailnet IP is
-found, it falls back to `PAPERCLIP_BIND=loopback` and leaves
-`PAPERCLIP_TAILNET_BIND_HOST` **unset** — setting it to a loopback address makes
-the server refuse to start.
+found, it leaves `PAPERCLIP_BIND`/`PAPERCLIP_TAILNET_BIND_HOST` unset so
+paperclip falls back to its own default (loopback, `local_trusted`).
+
+**Tailnet binding also forces `authenticated` + `private` deployment mode.**
+Paperclip's env loader defaults `deploymentMode` to `local_trusted`, and
+`local_trusted` always requires loopback binding — it silently *ignores*
+`PAPERCLIP_BIND` (and `PAPERCLIP_BIND_HOST`/`HOST`) when set, so
+`PAPERCLIP_BIND=tailnet` alone is a no-op and the server binds loopback while
+looking like it started fine. `paperclip-serve` therefore also exports
+`PAPERCLIP_DEPLOYMENT_MODE=authenticated` and
+`PAPERCLIP_DEPLOYMENT_EXPOSURE=private` whenever it resolves a tailnet host
+(this is the only mode/exposure combination that permits `bind=tailnet` —
+`authenticated`+`public` rejects it outright). `authenticated` mode in turn
+requires `PAPERCLIP_AGENT_JWT_SECRET`; the wrapper generates one once and
+persists it to `~/.paperclip-serve/env` (mode 600), the same idiom
+`opencode-serve` uses for its own secrets. An operator-supplied
+`PAPERCLIP_AGENT_JWT_SECRET` always takes precedence over the generated one.
 
 ### Hermes non-loopback auth requirement
 
@@ -128,12 +142,19 @@ mode; `opencode serve` does not support a `--autoso` flag. Set
 
 ### paperclip
 
-| Env var                  | Default            | Purpose                                        |
-| ------------------------- | ------------------- | ------------------------------------------------ |
-| `PAPERCLIP_SERVE_HOST`    | auto (tailnet IP)   | Force a specific bind host                       |
-| `PAPERCLIP_SERVE_PORT`    | `3100`              | Listen port (maps to paperclip's own `PORT`)     |
-| `PAPERCLIP_HOME`          | `~/.paperclip`      | Paperclip data directory                         |
-| `PAPERCLIP_INSTANCE_ID`   | `default`           | Instance name passed to `paperclipai run --instance` |
+| Env var                        | Default            | Purpose                                        |
+| -------------------------------- | ------------------- | ------------------------------------------------ |
+| `PAPERCLIP_SERVE_HOST`          | auto (tailnet IP)   | Force a specific bind host                       |
+| `PAPERCLIP_SERVE_PORT`          | `3100`              | Listen port (maps to paperclip's own `PORT`)     |
+| `PAPERCLIP_HOME`                | `~/.paperclip`      | Paperclip data directory                         |
+| `PAPERCLIP_INSTANCE_ID`         | `default`           | Instance name passed to `paperclipai run --instance` |
+| `PAPERCLIP_SERVE_DIR`           | `~/.paperclip-serve`| Secrets directory (auto-generated JWT secret)    |
+| `PAPERCLIP_DEPLOYMENT_MODE`     | `authenticated`\*   | Deployment mode when tailnet-bound               |
+| `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private`\*         | Deployment exposure when tailnet-bound           |
+| `PAPERCLIP_AGENT_JWT_SECRET`    | auto-generated      | Auth secret; an operator-supplied value always wins |
+
+\* Only set/defaulted when a tailnet host is resolved; left untouched on the
+loopback fallback so paperclip keeps its own `local_trusted` default.
 
 ### hermes
 
@@ -152,13 +173,15 @@ systemctl --user edit opencode-serve      # add [Service] Environment=OPENCODE_S
 
 ## Secrets
 
-Only `opencode-serve` generates secrets; `paperclip` and `hermes` manage their
-own auth outside this repo's control.
+`opencode-serve` and `paperclip-serve` each generate their own secrets once and
+persist them locally (mode 600); `hermes` manages its own auth outside this
+repo's control.
 
-| File                       | Contents                                    |
-| --------------------------- | -------------------------------------------- |
-| `~/.opencode-serve/env`     | `OPENCODE_SERVER_PASSWORD=<base64url 32B>`   |
-| `~/.opencode-serve/token`   | `<base64url 32B>`                            |
+| File                          | Contents                                    |
+| ------------------------------ | -------------------------------------------- |
+| `~/.opencode-serve/env`        | `OPENCODE_SERVER_PASSWORD=<base64url 32B>`   |
+| `~/.opencode-serve/token`      | `<base64url 32B>`                            |
+| `~/.paperclip-serve/env`       | `PAPERCLIP_AGENT_JWT_SECRET=<base64url 32B>` |
 
 Generated once via `openssl rand -base64 32` (URL-safe). Delete them and
 restart the service to rotate.
