@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.opencode.serve</string>
+  <string>com.agents-serve.opencode</string>
   <key>ProgramArguments</key>
   <array>
     <string>__WRAPPER__</string>
