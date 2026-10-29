@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# `session-offload` is not part of mainstream OpenCode — it only exists in
+# builds that add it (e.g. the @vibetechnologies/opencode fork this repo used
+# to install). Fail with a clear message instead of the binary's raw
+# "unknown command" error when the installed build does not provide it.
+if ! opencode session-offload --help >/dev/null 2>&1; then
+  printf '%s\n' "opencode-session-offload: the installed opencode build does not provide 'session-offload'." >&2
+  printf '%s\n' "Mainstream OpenCode archives/moves sessions via 'opencode session export' / 'opencode session import' instead." >&2
+  exit 127
+fi
+
 exec opencode session-offload "$@"

@@ -27,7 +27,14 @@ BIN_DIR="$PREFIX/bin"
 LIB_DIR="$PREFIX/lib/agents-serve"
 OS="$(uname -s)"
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+# Only trust BASH_SOURCE for the checkout location. When the script is piped
+# (curl | bash), BASH_SOURCE is empty and $0 is just "bash" — falling back to
+# $0 would make SELF_DIR the caller's cwd, and fetch() could then silently
+# pick up unrelated same-named files from that directory instead of the repo.
+SELF_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SELF_DIR=""
+fi
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -43,9 +50,23 @@ fetch() {
   fi
 }
 
+# Write a fetched file to its destination atomically: fetch into a temp file
+# in the same directory and rename on success, so a failed download cannot
+# truncate a previously working wrapper/lib that is already installed.
+fetch_to() {
+  local rel="$1" dest="$2" tmp
+  tmp="$(mktemp "${dest}.tmp.XXXXXX")"
+  if fetch "$rel" > "$tmp"; then
+    mv "$tmp" "$dest"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 install_lib() {
   mkdir -p "$LIB_DIR"
-  fetch "lib/tailnet.sh" > "$LIB_DIR/tailnet.sh"
+  fetch_to "lib/tailnet.sh" "$LIB_DIR/tailnet.sh"
   say "shared lib installed -> $LIB_DIR/tailnet.sh"
 }
 
@@ -58,26 +79,34 @@ resolved_host_preview() {
 
 # ------------------------------------------------------------------ opencode --
 install_opencode_upstream() {
+  # Migrate off the Vibe Technologies fork when it was installed via npm:
+  # it provides the same `opencode` binary, so the present-check below would
+  # otherwise keep the fork forever and the mainstream install never happens.
+  if command -v npm >/dev/null 2>&1 \
+     && npm list -g --depth=0 2>/dev/null | grep -q '@vibetechnologies/opencode'; then
+    say "removing @vibetechnologies/opencode fork — replaced by mainstream @opencode/cli"
+    npm uninstall -g @vibetechnologies/opencode
+  fi
   if command -v opencode >/dev/null 2>&1; then
     say "opencode present: $(opencode --version 2>/dev/null || echo unknown)"
     return
   fi
   if command -v npm >/dev/null 2>&1; then
-    say "installing @vibetechnologies/opencode via npm"
-    npm install -g @vibetechnologies/opencode
+    say "installing @opencode/cli (mainstream OpenCode v2) via npm"
+    npm install -g @opencode/cli@latest
   else
-    say "installing opencode via upstream installer"
-    curl -fsSL https://opencode.ai/install | bash
+    say "installing opencode via upstream v2 installer"
+    curl -fsSL https://opencode.ai/v2/install | bash
   fi
 }
 
 install_opencode_wrapper() {
   mkdir -p "$BIN_DIR"
-  fetch "bin/opencode-serve" > "$BIN_DIR/opencode-serve"
+  fetch_to "bin/opencode-serve" "$BIN_DIR/opencode-serve"
   chmod +x "$BIN_DIR/opencode-serve"
-  fetch "bin/opencode-cli" > "$BIN_DIR/opencode-cli"
+  fetch_to "bin/opencode-cli" "$BIN_DIR/opencode-cli"
   chmod +x "$BIN_DIR/opencode-cli"
-  fetch "bin/opencode-session-offload" > "$BIN_DIR/opencode-session-offload"
+  fetch_to "bin/opencode-session-offload" "$BIN_DIR/opencode-session-offload"
   chmod +x "$BIN_DIR/opencode-session-offload"
   say "opencode wrapper/CLI/offload installed -> $BIN_DIR"
 }
@@ -108,7 +137,7 @@ install_opencode_linux() {
   systemctl --user reset-failed opencode-serve.service 2>/dev/null || true
   systemctl --user enable opencode-serve.service
   systemctl --user restart opencode-serve.service
-  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+  loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
   say "opencode service started (systemd --user)"
 }
 
@@ -174,7 +203,7 @@ install_paperclip_upstream() {
 
 install_paperclip_wrapper() {
   mkdir -p "$BIN_DIR"
-  fetch "bin/paperclip-serve" > "$BIN_DIR/paperclip-serve"
+  fetch_to "bin/paperclip-serve" "$BIN_DIR/paperclip-serve"
   chmod +x "$BIN_DIR/paperclip-serve"
   say "paperclip wrapper installed -> $BIN_DIR/paperclip-serve"
 }
@@ -192,7 +221,7 @@ install_paperclip_linux() {
   systemctl --user reset-failed paperclip-serve.service 2>/dev/null || true
   systemctl --user enable paperclip-serve.service
   systemctl --user restart paperclip-serve.service
-  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+  loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
   say "paperclip service started (systemd --user)"
 }
 
@@ -256,7 +285,7 @@ install_hermes_upstream() {
 
 install_hermes_wrapper() {
   mkdir -p "$BIN_DIR"
-  fetch "bin/hermes-serve" > "$BIN_DIR/hermes-serve"
+  fetch_to "bin/hermes-serve" "$BIN_DIR/hermes-serve"
   chmod +x "$BIN_DIR/hermes-serve"
   say "hermes wrapper installed -> $BIN_DIR/hermes-serve"
 }
@@ -274,7 +303,7 @@ install_hermes_linux() {
   systemctl --user reset-failed hermes-serve.service 2>/dev/null || true
   systemctl --user enable hermes-serve.service
   systemctl --user restart hermes-serve.service
-  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+  loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
   say "hermes service started (systemd --user)"
 }
 

@@ -13,7 +13,7 @@ default; pass names to install a subset.
 
 | Service     | What it is                                   | Default port | Upstream install                                                                    | Auth notes |
 | ----------- | --------------------------------------------- | ------------- | ------------------------------------------------------------------------------------ | ---------- |
-| `opencode`  | [OpenCode](https://opencode.ai) headless server | `4096`        | `@vibetechnologies/opencode` via npm, else `curl -fsSL https://opencode.ai/install \| bash` | Server password + token, generated locally |
+| `opencode`  | [OpenCode](https://opencode.ai) headless server | `4096`        | `@opencode/cli` (mainstream v2) via npm, else `curl -fsSL https://opencode.ai/v2/install \| bash` | Server password + token, generated locally |
 | `paperclip` | [Paperclip](https://paperclip.ing) AI agent server | `3100`        | `curl -fsSL https://paperclip.ing/install.sh \| bash -s -- --no-prompt --no-onboard`   | Tailnet bind forces `authenticated`+`private` mode; JWT secret auto-generated locally |
 | `hermes`    | [Hermes](https://github.com/NousResearch/hermes-agent) AI agent server | `9119`        | `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash` | **Requires auth configured** for non-loopback binds (see below) |
 
@@ -38,6 +38,14 @@ given). An unknown name aborts immediately with the valid list. Each service is
 installed independently — if one fails (e.g. its upstream installer is down),
 the others still proceed; the script reports a warning per failure and exits
 non-zero at the end if anything failed.
+
+> **Fork migration:** older versions of this installer installed the
+> `@vibetechnologies/opencode` fork. The installer now installs mainstream
+> OpenCode v2 (`@opencode/cli`). If the fork is present as a global npm
+> package it is uninstalled automatically first — it provides the same
+> `opencode` binary and would otherwise shadow the mainstream install
+> forever. A fork installed by other means (e.g. its own curl installer) is
+> not detected: remove that `opencode` binary manually, then re-run.
 
 The installer, per service:
 
@@ -226,6 +234,12 @@ the connection leaves a trusted private network. The client requires `curl` and
 `jq` on the client machine.
 
 ## Session offload (opencode)
+
+> **Fork-only:** `session-offload` is not part of mainstream OpenCode — it
+> only exists in builds that add it (e.g. the `@vibetechnologies/opencode`
+> fork this installer previously installed). With a mainstream build the
+> wrapper exits with a clear error; use `opencode session export` /
+> `opencode session import` there instead.
 
 Archive and remove sessions inactive for seven days. The command prints archive
 bytes, database size, and reusable SQLite space:

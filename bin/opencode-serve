@@ -26,6 +26,13 @@ else
   . "${PREFIX:-$HOME/.local}/lib/agents-serve/tailnet.sh"
 fi
 
+# Widen PATH so tailscale/opencode installed via Homebrew or ~/.local/bin are
+# found even under a minimal launchd/systemd PATH (same idiom as
+# paperclip-serve and hermes-serve; this wrapper was missing it, so
+# resolve_host could fail to find the tailscale CLI and silently fall back
+# to the interface scan / loopback).
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
+
 SERVE_DIR="${OPENCODE_SERVE_DIR:-$HOME/.opencode-serve}"
 ENV_FILE="$SERVE_DIR/env"
 TOKEN_FILE="$SERVE_DIR/token"
