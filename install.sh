@@ -139,6 +139,7 @@ install_opencode_linux() {
   systemctl --user restart opencode-serve.service
   loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
   say "opencode service started (systemd --user)"
+  expose_opencode_publicly "$log"
 }
 
 install_opencode_macos() {
@@ -162,6 +163,7 @@ install_opencode_macos() {
   launchctl unload "$plist" 2>/dev/null || true
   launchctl load -w "$plist"
   say "opencode service started (launchd)"
+  expose_opencode_publicly "$log"
 }
 
 print_opencode_info() {
@@ -177,6 +179,33 @@ print_opencode_info() {
     printf '    Logs:     journalctl --user -u opencode-serve -f  (or ~/.cache/opencode-serve/serve.log)\n'
   else
     printf '    Logs:     ~/Library/Logs/opencode-serve.log\n'
+  fi
+  if [ "${OPENCODE_SERVE_PUBLIC:-0}" = "1" ]; then
+    printf '    Public:   https://%s:%s\n' "${host:-<tailnet-ip>}" "${OPENCODE_SERVE_FUNNEL_PORT:-443}"
+  fi
+}
+
+# ----------------------------------------------------------------- public --
+# Expose an already-running opencode server publicly over HTTPS via Tailscale
+# Funnel (https://<tailnet-host>:<port>). Opt-in only: private tailnet binds
+# remain the default. Funnel must be enabled once in the tailnet admin console
+# (the installer prints the link when it's missing). Binding targets the
+# server's actual address — never the unauthenticated legacy loopback server.
+expose_opencode_publicly() {
+  [ "${OPENCODE_SERVE_PUBLIC:-0}" = "1" ] || return 0
+  local log="$1"
+  command -v tailscale >/dev/null 2>&1 || {
+    warn "tailscale CLI not found — opencode stays tailnet-only"
+    return 0
+  }
+  local port funnel_port host
+  port="${OPENCODE_SERVE_PORT:-4096}"
+  funnel_port="${OPENCODE_SERVE_FUNNEL_PORT:-443}"
+  host="$(resolved_host_preview "${OPENCODE_SERVE_HOST:-}" 2>/dev/null || true)"
+  [ -n "$host" ] || host=127.0.0.1
+  say "exposing opencode publicly via Tailscale Funnel at https://${host}:${funnel_port} -> ${host}:${port}"
+  if ! tailscale funnel --bg --https "$funnel_port" "http://$host:$port" >> "$log" 2>&1; then
+    warn "tailscale funnel failed — enable funnel in your tailnet admin console, or set OPENCODE_SERVE_FUNNEL_PORT if port $funnel_port is already in use"
   fi
 }
 

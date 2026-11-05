@@ -142,11 +142,41 @@ prints this reminder after setting up the service.
 | `OPENCODE_SERVE_PORT`  | `4096`               | Listen port                          |
 | `OPENCODE_SERVE_DIR`   | `~/.opencode-serve`  | Secrets directory                    |
 | `OPENCODE_PERMISSION`  | `{"*":"allow"}`      | Permission policy for headless mode  |
+| `OPENCODE_SERVE_PUBLIC`| `0`                  | Set to `1` to expose publicly over HTTPS via Tailscale Funnel |
+| `OPENCODE_SERVE_FUNNEL_PORT`| `443`           | HTTPS port of the public Funnel endpoint |
 
 The wrapper configures OpenCode's supported permission policy so the headless
 agent does not stop for approval prompts. This is equivalent to an auto-approve
 mode; `opencode serve` does not support a `--autoso` flag. Set
 `OPENCODE_PERMISSION` to a stricter JSON policy when needed.
+
+## Public exposure (Tailscale Funnel)
+
+By default `opencode-serve` binds to the node's tailnet address only. Set
+`OPENCODE_SERVE_PUBLIC=1` in the installer environment to additionally expose
+it publicly over HTTPS via Tailscale Funnel:
+
+```bash
+OPENCODE_SERVE_PUBLIC=1 OPENCODE_SERVE_FUNNEL_PORT=443 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh) -s -- opencode
+```
+
+The public URL is `https://<tailnet-host>.ts.net:<port>` (port defaults to
+`443`, overridable with `OPENCODE_SERVE_FUNNEL_PORT`).
+
+Funnel is disabled in the tailnet admin console by default; enable it once at
+the link printed by the installer (or run `tailscale funnel`). If
+`tailscale serve` already serves `ts.net:443`, pick another port, e.g.
+`OPENCODE_SERVE_FUNNEL_PORT=8443`.
+
+### Security
+
+The exposed server runs with `OPENCODE_PERMISSION={"*":"allow"}` — anyone who
+knows the basic-auth password (`opencode:<password in ~/.opencode-serve/env>`)
+can execute code on this machine over HTTPS. Keep the URL private, rotate the
+password by deleting `~/.opencode-serve/env` and restarting the service, or
+front it with Cloudflare Access / an IP allowlist if you need a published
+address.
 
 ### paperclip
 
