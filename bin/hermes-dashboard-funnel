@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# hermes-dashboard-funnel
+#
+# Install (or update) the Hermes web dashboard as a systemd --user service and
+# publish it on the public internet through Tailscale Funnel.
+#
+# One-liner (Linux / systemd):
+#   curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash
+#
+# What it does
+#   1. Writes ~/.config/systemd/user/hermes-dashboard.service
+#   2. Starts the dashboard on 127.0.0.1:<port> with authentication enabled
+#   3. Writes the public URL + basic-auth credentials to
+#      ~/.hermes/dashboard-funnel.env (mode 0600)
+#   4. Runs `tailscale funnel --bg --https=<port>` and prints the public URL
+#   5. If Funnel is not enabled on the tailnet, prints the admin URL to enable it
+#
+# IMPORTANT — Funnel is public
+#   Binding the dashboard to 127.0.0.1 and proxying it through Tailscale would
+#   normally skip Hermes' login gate because the proxy connects from loopback.
+#   This script therefore sets HERMES_DASHBOARD_PUBLIC_URL to the Funnel host,
+#   which forces the auth gate on, and provisions a basic-auth password unless
+#   OAuth or basic auth is already configured.
+#
+# Usage
+#   ./hermes-dashboard-funnel                    # install / update / expose
+#   ./hermes-dashboard-funnel --port 9120
+#   ./hermes-dashboard-funnel --https-port 8443  # funnel: 443 | 8443 | 10000
+#   ./hermes-dashboard-funnel --show-password    # print the login credentials
+#   ./hermes-dashboard-funnel --reset-password   # rotate the generated password
+#   ./hermes-dashboard-funnel --status
+#   ./hermes-dashboard-funnel --remove
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+REPO_RAW="${AGENTS_SERVE_RAW:-https://raw.githubusercontent.com/dzianisv/agents-serve/main}"
+SELF_PATH="${BASH_SOURCE[0]:-}"
+if [[ -z "$SELF_PATH" || ! -f "$SELF_PATH" ]]; then
+    SELF_PATH=""  # piped via curl | bash; $0 is just "bash"
+fi
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_BIN="${HERMES_BIN:-}"
+UNIT_NAME="hermes-dashboard.service"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
+ENV_FILE="$HERMES_HOME/dashboard-funnel.env"
+
+PORT="${HERMES_DASHBOARD_PORT:-9119}"
+HTTPS_PORT=443
+RESET_PASSWORD=0
+ACTION="install"
+FUNNEL_OUT=""
+HAVE_TAILSCALE=0
+
+# ── output helpers ───────────────────────────────────────────────────────────
+info() { printf '→ %s\n' "$*"; }
+ok()   { printf '✓ %s\n' "$*"; }
+warn() { printf '⚠ %s\n' "$*" >&2; }
+die()  { printf '\n✗ %s\n' "$*" >&2; exit 1; }
+rule() { printf '─%.0s' $(seq 1 68); printf '\n'; }
+banner() {
+    echo "════════════════════════════════════════════════════════════════════"
+    printf ' %s\n' "$1"
+    echo "════════════════════════════════════════════════════════════════════"
+}
+
+cleanup() {
+    if [[ -n "$FUNNEL_OUT" && -f "$FUNNEL_OUT" ]]; then rm -f "$FUNNEL_OUT"; fi
+}
+trap cleanup EXIT
+
+usage() {
+    cat <<'USAGE'
+Usage: hermes-dashboard-funnel [options]
+
+  --port N            Dashboard port on 127.0.0.1 (default: 9119)
+  --https-port N      Funnel HTTPS port: 443 | 8443 | 10000 (default: 443)
+  --show-password     Print the dashboard login URL, username, and password
+  --reset-password    Rotate the generated basic-auth password
+  --status            Show service, local URL, and funnel status
+  --remove            Stop the service, remove the unit, and drop the funnel mount
+  -h, --help          Show this help
+
+Examples:
+  ./hermes-dashboard-funnel
+  ./hermes-dashboard-funnel --port 9120
+  curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash
+  curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --status
+USAGE
+}
+
+# The command a user should run to retry (works both from a checkout and from
+# the curl | bash one-liner, where BASH_SOURCE is empty).
+rerun_command() {
+    if [[ -n "$SELF_PATH" ]]; then
+        printf '%s --port %s --https-port %s' "$SELF_PATH" "$PORT" "$HTTPS_PORT"
+    else
+        printf 'curl -fsSL %s/bin/hermes-dashboard-funnel | bash -s -- --port %s --https-port %s' \
+            "$REPO_RAW" "$PORT" "$HTTPS_PORT"
+    fi
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+# Read a KEY=VALUE pair from the systemd env file (last occurrence wins).
+env_get() {
+    local key="$1" line=""
+    [[ -f "$ENV_FILE" ]] || return 0
+    line="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 || true)"
+    [[ -n "$line" ]] || return 0
+    line="${line#*=}"
+    line="${line%$'\r'}"
+    if [[ "$line" == \"*\" && "$line" == *\" ]]; then
+        line="${line:1:${#line}-2}"
+    elif [[ "$line" == \'*\' && "$line" == *\' ]]; then
+        line="${line:1:${#line}-2}"
+    fi
+    printf '%s' "$line"
+}
+
+gen_password() { openssl rand -base64 24 | tr -d '\n=' | tr '+/' '-_'; }
+gen_secret()   { openssl rand -hex 32; }
+
+# Print the dashboard auth config as JSON. Uses system python3 + PyYAML so we
+# don't have to boot the full Hermes runtime just to read one config section.
+read_config_auth() {
+    local cfg="$HERMES_HOME/config.yaml"
+    if [[ ! -f "$cfg" ]]; then
+        printf '%s\n' '{"basic_user":"","basic_has_password":false,"oauth_client_id":""}'
+        return 0
+    fi
+    python3 - "$cfg" <<'PY' 2>/dev/null || printf '%s\n' '{"basic_user":"","basic_has_password":false,"oauth_client_id":""}'
+import json, sys
+try:
+    import yaml
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+    dash = cfg.get("dashboard") or {}
+    basic = dash.get("basic_auth") or {}
+    oauth = dash.get("oauth") or {}
+    print(json.dumps({
+        "basic_user": str(basic.get("username") or ""),
+        "basic_has_password": bool(str(basic.get("password_hash") or basic.get("password") or "").strip()),
+        "oauth_client_id": str(oauth.get("client_id") or ""),
+    }))
+except Exception:
+    print(json.dumps({"basic_user": "", "basic_has_password": False, "oauth_client_id": ""}))
+PY
+}
+
+# ── arguments ────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)
+            [[ $# -ge 2 ]] || die "--port needs a value"
+            PORT="$2"; shift 2 ;;
+        --https-port)
+            [[ $# -ge 2 ]] || die "--https-port needs a value"
+            HTTPS_PORT="$2"; shift 2 ;;
+        --show-password) ACTION="show-password"; shift ;;
+        --reset-password) RESET_PASSWORD=1; shift ;;
+        --status) ACTION="status"; shift ;;
+        --remove) ACTION="remove"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "Unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) \
+    || die "--port must be an integer between 1 and 65535"
+case "$HTTPS_PORT" in
+    443|8443|10000) ;;
+    *) die "--https-port must be 443, 8443, or 10000 (Tailscale Funnel restriction)" ;;
+esac
+
+# ── preflight ────────────────────────────────────────────────────────────────
+need systemctl
+if [[ "$ACTION" != "remove" ]]; then
+    need tailscale
+    need curl
+    need jq
+    need openssl
+    need python3
+elif command -v tailscale >/dev/null 2>&1; then
+    HAVE_TAILSCALE=1
+else
+    HAVE_TAILSCALE=0
+fi
+
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if ! systemctl --user show-environment >/dev/null 2>&1; then
+        die "systemd --user is not reachable. Log in as $(id -un) and retry (or set XDG_RUNTIME_DIR=/run/user/$(id -u))."
+    fi
+fi
+
+# Resolve a working hermes launcher later (install only). A stale shim can
+# exist on PATH (e.g. one pointing at a deleted /tmp toolchain), so validate
+# each candidate with `--version` and fall through to the next instead of
+# writing a unit that can only crash-loop.
+resolve_hermes_bin() {
+    local candidate
+    for candidate in \
+        "$HERMES_BIN" \
+        "$(command -v hermes 2>/dev/null || true)" \
+        "$HOME/.local/bin/hermes" \
+        "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" \
+        "$HERMES_HOME/hermes-agent/venv/bin/hermes"; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if timeout 20 "$candidate" --version >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── tailnet identity ─────────────────────────────────────────────────────────
+if [[ "$ACTION" != "remove" ]]; then
+    tailscale status >/dev/null 2>&1 \
+        || die "Tailscale is not running or not logged in. Run: tailscale up"
+
+    TS_JSON="$(tailscale status --json 2>/dev/null)" \
+        || die "Could not read Tailscale status"
+    DNS_NAME="$(jq -r '.Self.DNSName // ""' <<<"$TS_JSON" | sed 's/\.$//')"
+    [[ -n "$DNS_NAME" ]] \
+        || die "Tailscale has no MagicDNS name for this node. Enable MagicDNS + HTTPS certificates in the Tailscale admin console, then retry."
+
+    if [[ "$HTTPS_PORT" == "443" ]]; then
+        FUNNEL_URL="https://$DNS_NAME"
+    else
+        FUNNEL_URL="https://$DNS_NAME:$HTTPS_PORT"
+    fi
+
+    DASHBOARD_STATE="$(read_config_auth)"
+    CFG_BASIC_USER="$(jq -r '.basic_user // ""' <<<"$DASHBOARD_STATE")"
+    CFG_HAS_BASIC="$(jq -r '.basic_has_password // false' <<<"$DASHBOARD_STATE")"
+    CFG_OAUTH="$(jq -r '.oauth_client_id // ""' <<<"$DASHBOARD_STATE")"
+
+    # OAuth can also live in ~/.hermes/.env.
+    ENV_OAUTH=""
+    if [[ -f "$HERMES_HOME/.env" ]]; then
+        ENV_OAUTH="$(grep -E '^HERMES_DASHBOARD_OAUTH_CLIENT_ID=.' "$HERMES_HOME/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    fi
+fi
+
+# ── status ───────────────────────────────────────────────────────────────────
+if [[ "$ACTION" == "status" ]]; then
+    funnel_allow="false"
+    if funnel_json="$(tailscale funnel status --json 2>/dev/null)"; then
+        funnel_allow="$(jq -r --arg host "$DNS_NAME:$HTTPS_PORT" '.AllowFunnel[$host] // false' <<<"$funnel_json" 2>/dev/null || true)"
+    fi
+
+    echo
+    echo "Hermes dashboard funnel status"
+    rule
+    printf 'Service:      %s\n' "$UNIT_NAME"
+    printf 'Unit file:    %s\n' "$UNIT_PATH"
+    printf 'Env file:     %s\n' "$ENV_FILE"
+    printf 'Local URL:    http://127.0.0.1:%s\n' "$PORT"
+    if [[ "$funnel_allow" == "true" ]]; then
+        printf 'Public URL:   %s\n' "$FUNNEL_URL"
+    else
+        printf 'Public URL:   %s  (pending; Funnel not enabled)\n' "$FUNNEL_URL"
+    fi
+
+    if [[ -f "$UNIT_PATH" ]]; then
+        printf 'systemd:      %s\n' "$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)"
+    else
+        printf 'systemd:      not installed\n'
+    fi
+
+    local_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)"
+    printf 'HTTP /login:  %s\n' "${local_code:-unreachable}"
+
+    echo
+    echo "Tailscale funnel config:"
+    tailscale funnel status 2>&1 | sed 's/^/  /' || true
+
+    echo
+    printf 'Username:      %s\n' "$(env_get HERMES_DASHBOARD_BASIC_AUTH_USERNAME || true)"
+    printf 'Credentials:   %s\n' "$ENV_FILE"
+    exit 0
+fi
+
+# ── show-password ────────────────────────────────────────────────────────────
+if [[ "$ACTION" == "show-password" ]]; then
+    env_user="$(env_get HERMES_DASHBOARD_BASIC_AUTH_USERNAME)"
+    env_pass="$(env_get HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)"
+    echo
+    printf 'URL:      %s/login\n' "$FUNNEL_URL"
+    if [[ -n "$env_pass" ]]; then
+        printf 'Username: %s\nPassword: %s\n' "${env_user:-admin}" "$env_pass"
+    elif [[ "$CFG_HAS_BASIC" == "true" ]]; then
+        printf 'Username: %s\nPassword: existing password in %s/config.yaml\n' "$CFG_BASIC_USER" "$HERMES_HOME"
+    else
+        printf 'Login:    Nous Portal OAuth\n'
+    fi
+    exit 0
+fi
+
+# ── remove ───────────────────────────────────────────────────────────────────
+if [[ "$ACTION" == "remove" ]]; then
+    info "Stopping and removing $UNIT_NAME"
+    systemctl --user disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+    rm -f "$UNIT_PATH"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$UNIT_NAME" >/dev/null 2>&1 || true
+
+    info "Removing any Funnel mount on port $HTTPS_PORT"
+    if [[ "$HAVE_TAILSCALE" -eq 1 ]]; then
+        timeout 10 tailscale funnel --https="$HTTPS_PORT" off >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$ENV_FILE"
+    ok "Removed $UNIT_NAME, its funnel mount, and $ENV_FILE"
+    echo "  The dashboard is no longer public. Local processes were not touched."
+    exit 0
+fi
+
+# ── resolve launcher + check the port ────────────────────────────────────────
+HERMES_BIN="$(resolve_hermes_bin || true)"
+[[ -n "$HERMES_BIN" ]] \
+    || die "No working hermes CLI found. Expected $HERMES_HOME/hermes-agent/.hermes/bin/hermes (or 'hermes' on PATH)."
+ok "Using hermes launcher: $HERMES_BIN"
+
+# Our own active service owns the port during an update; anything else must be
+# stopped first. In this repo the usual conflict is hermes-serve.service, which
+# also defaults to 9119.
+if ! systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+    if systemctl --user is-active --quiet hermes-serve.service 2>/dev/null; then
+        die "hermes-serve.service is already running (it uses port 9119 by default). Stop it first: systemctl --user disable --now hermes-serve.service"
+    fi
+    if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$PORT" 2>/dev/null | grep -q .; then
+        die "Port $PORT is already in use. Stop that process, or re-run with --port <free-port>."
+    fi
+fi
+
+# ── pick auth mode ───────────────────────────────────────────────────────────
+ENV_USER="$(env_get HERMES_DASHBOARD_BASIC_AUTH_USERNAME)"
+ENV_PASS="$(env_get HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)"
+ENV_SECRET="$(env_get HERMES_DASHBOARD_BASIC_AUTH_SECRET)"
+
+AUTH_MODE=""
+USERNAME=""
+PASSWORD=""
+SECRET=""
+GENERATED_PASSWORD=0
+
+if [[ "$RESET_PASSWORD" -eq 0 && -n "$ENV_USER" && -n "$ENV_PASS" ]]; then
+    AUTH_MODE="basic-env"
+    USERNAME="$ENV_USER"
+    PASSWORD="$ENV_PASS"
+    SECRET="${ENV_SECRET:-$(gen_secret)}"
+elif [[ "$RESET_PASSWORD" -eq 0 && -n "$CFG_OAUTH$ENV_OAUTH" ]]; then
+    AUTH_MODE="oauth"
+elif [[ "$RESET_PASSWORD" -eq 0 && "$CFG_HAS_BASIC" == "true" ]]; then
+    AUTH_MODE="basic-config"
+    USERNAME="$CFG_BASIC_USER"
+else
+    AUTH_MODE="basic-env"
+    USERNAME="${HERMES_DASHBOARD_USER:-${CFG_BASIC_USER:-admin}}"
+    PASSWORD="$(gen_password)"
+    SECRET="$(gen_secret)"
+    GENERATED_PASSWORD=1
+fi
+
+# ── lingering ────────────────────────────────────────────────────────────────
+linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+if [[ "$linger" != "yes" ]]; then
+    if loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+        ok "Enabled systemd lingering (starts at boot without a login)"
+    else
+        warn "Could not enable linger; the service will only run while you are logged in."
+        warn "Run: sudo loginctl enable-linger $(id -un)"
+    fi
+fi
+
+# ── write env file (public URL + credentials) ────────────────────────────────
+umask 077
+mkdir -p "$HERMES_HOME"
+env_tmp="$(mktemp "$HERMES_HOME/.dashboard-funnel-env.XXXXXX")"
+{
+    printf 'HERMES_DASHBOARD_PUBLIC_URL=%s\n' "$FUNNEL_URL"
+    if [[ "$AUTH_MODE" == "basic-env" ]]; then
+        printf 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=%s\n' "$USERNAME"
+        printf 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=%s\n' "$PASSWORD"
+        printf 'HERMES_DASHBOARD_BASIC_AUTH_SECRET=%s\n' "$SECRET"
+    fi
+} >"$env_tmp"
+env_changed=1
+if [[ -f "$ENV_FILE" ]] && cmp -s "$env_tmp" "$ENV_FILE"; then
+    env_changed=0
+    rm -f "$env_tmp"
+    ok "Unchanged: $ENV_FILE"
+else
+    mv -f "$env_tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    ok "Wrote $ENV_FILE (0600)"
+fi
+
+# ── write the systemd --user unit ────────────────────────────────────────────
+mkdir -p "$UNIT_DIR"
+unit_tmp="$(mktemp "$UNIT_DIR/.$UNIT_NAME.XXXXXX")"
+cat >"$unit_tmp" <<EOF
+[Unit]
+Description=Hermes Agent Dashboard (Tailscale Funnel: $FUNNEL_URL)
+Documentation=https://github.com/dzianisv/agents-serve/blob/main/bin/hermes-dashboard-funnel
+After=network-online.target tailscaled.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart="$HERMES_BIN" dashboard --host 127.0.0.1 --port $PORT --no-open --skip-build --isolated
+WorkingDirectory=$HERMES_HOME
+Environment="HOME=$HOME"
+Environment="HERMES_HOME=$HERMES_HOME"
+Environment="HERMES_SUPERVISED_CHILD=1"
+Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+EnvironmentFile=$ENV_FILE
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=78
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+unit_changed=1
+if [[ -f "$UNIT_PATH" ]] && cmp -s "$unit_tmp" "$UNIT_PATH"; then
+    unit_changed=0
+    rm -f "$unit_tmp"
+    ok "Unchanged: $UNIT_PATH"
+else
+    chmod 644 "$unit_tmp"
+    mv -f "$unit_tmp" "$UNIT_PATH"
+    ok "Wrote $UNIT_PATH"
+fi
+
+# ── start the service ────────────────────────────────────────────────────────
+# Rerunning the installer is common. Restarting Hermes can take ~60s on a cold
+# dependency check, and Funnel answers 502 while it is down — so leave a
+# healthy service alone when nothing changed.
+service_healthy=0
+if systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null \
+   && curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$PORT/login" 2>/dev/null; then
+    service_healthy=1
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable "$UNIT_NAME" >/dev/null 2>&1 || true
+
+if [[ "$env_changed" -eq 0 && "$unit_changed" -eq 0 && "$service_healthy" -eq 1 ]]; then
+    ok "Service is already running; no restart needed"
+    ready=1
+else
+    info "Starting $UNIT_NAME on 127.0.0.1:$PORT"
+    systemctl --user restart "$UNIT_NAME"
+
+    ready=0
+    for _ in $(seq 1 90); do
+        if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/login" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        if systemctl --user is-failed --quiet "$UNIT_NAME" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+if [[ "$ready" -ne 1 ]]; then
+    warn "Dashboard did not become ready. Recent service output:"
+    journalctl --user -u "$UNIT_NAME" -n 40 --no-pager 2>/dev/null || true
+    die "Service failed to start. Fix the error above, then re-run this script."
+fi
+ok "Dashboard is up (localhost only)"
+
+# ── configure Tailscale Funnel ───────────────────────────────────────────────
+# Refuse to silently replace a different service already mounted at / on this
+# HTTPS port (Tailscale Serve/Funnel share the same host:port namespace).
+existing_proxy="$(tailscale serve status --json 2>/dev/null \
+    | jq -r --arg host "$DNS_NAME:$HTTPS_PORT" '.Web[$host].Handlers["/"].Proxy // empty' 2>/dev/null || true)"
+if [[ -n "$existing_proxy" && "$existing_proxy" != "http://127.0.0.1:$PORT" ]]; then
+    warn "https/$HTTPS_PORT already serves $existing_proxy on this node."
+    warn "Continuing will replace that / mount with the Hermes dashboard."
+fi
+
+info "Configuring Tailscale Funnel on https/$HTTPS_PORT → http://127.0.0.1:$PORT"
+FUNNEL_OUT="$(mktemp "${TMPDIR:-/tmp}/hermes-funnel.XXXXXX")"
+set +e
+timeout 25 tailscale funnel --bg --yes --https="$HTTPS_PORT" "http://127.0.0.1:$PORT" >"$FUNNEL_OUT" 2>&1
+funnel_rc=$?
+set -e
+
+if [[ -s "$FUNNEL_OUT" ]]; then
+    sed 's/^/  /' "$FUNNEL_OUT"
+    echo
+fi
+
+funnel_configured=0
+funnel_allow="false"
+if funnel_json="$(tailscale funnel status --json 2>/dev/null)"; then
+    funnel_allow="$(jq -r --arg host "$DNS_NAME:$HTTPS_PORT" '.AllowFunnel[$host] // false' <<<"$funnel_json" 2>/dev/null || true)"
+fi
+if [[ "$funnel_allow" == "true" ]]; then
+    funnel_configured=1
+elif [[ "$funnel_rc" -eq 0 ]] && tailscale funnel status 2>/dev/null | grep -qF "http://127.0.0.1:$PORT"; then
+    # Older tailscaled builds may omit AllowFunnel from --json; trust a clean exit
+    # that also shows our proxy in the funnel status.
+    funnel_configured=1
+fi
+
+# Tailscale refuses Serve/Funnel writes when the current user is not the
+# operator. That is a different fix from "enable Funnel in the admin console",
+# so don't tell the user the wrong thing.
+funnel_failure="none"
+if [[ "$funnel_configured" -ne 1 ]]; then
+    if grep -qiE 'Access denied|operator' "$FUNNEL_OUT" 2>/dev/null; then
+        funnel_failure="operator"
+    elif grep -qiE 'not enabled|login\.tailscale\.com/f/funnel' "$FUNNEL_OUT" 2>/dev/null; then
+        funnel_failure="disabled"
+    else
+        funnel_failure="other"
+    fi
+fi
+
+# ── report ───────────────────────────────────────────────────────────────────
+echo
+if [[ "$funnel_configured" -eq 1 ]]; then
+    banner "Hermes dashboard is live on the public internet"
+elif [[ "$funnel_failure" == "operator" ]]; then
+    banner "Tailscale needs a one-time operator grant"
+elif [[ "$funnel_failure" == "disabled" ]]; then
+    banner "Funnel is NOT enabled on your tailnet yet"
+else
+    banner "Funnel configuration failed"
+fi
+
+printf '  Local URL:     http://127.0.0.1:%s\n' "$PORT"
+if [[ "$funnel_configured" -eq 1 ]]; then
+    printf '  Public URL:    %s\n' "$FUNNEL_URL"
+else
+    printf '  Funnel URL:    %s  (not live)\n' "$FUNNEL_URL"
+fi
+printf '  Service:       %s (systemd --user)\n' "$UNIT_NAME"
+printf '  Logs:          journalctl --user -u %s -f\n' "$UNIT_NAME"
+printf '  Env file:      %s\n' "$ENV_FILE"
+
+if [[ "$AUTH_MODE" == "oauth" ]]; then
+    printf '  Login:         Nous Portal OAuth\n'
+elif [[ "$AUTH_MODE" == "basic-config" ]]; then
+    printf '  Login:         %s / (your existing config.yaml password)\n' "$USERNAME"
+else
+    printf '  Login:         %s / %s\n' "$USERNAME" "$PASSWORD"
+fi
+
+if [[ "$funnel_configured" -eq 1 ]]; then
+    echo
+    info "Waiting for the public URL to answer (TLS cert may take a few seconds)…"
+    http_code=""
+    for _ in $(seq 1 15); do
+        http_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "$FUNNEL_URL/login" 2>/dev/null || true)"
+        [[ "$http_code" == "200" ]] && break
+        sleep 2
+    done
+    if [[ "$http_code" == "200" ]]; then
+        ok "Public URL is answering with HTTP 200 at $FUNNEL_URL/login"
+    else
+        warn "Public URL did not answer yet (got '${http_code:-no response}')."
+        warn "The TLS certificate may still be provisioning; retry in ~30 seconds."
+    fi
+    echo
+    echo "  Share/login page: $FUNNEL_URL/login"
+elif [[ "$funnel_failure" == "operator" ]]; then
+    echo
+    echo "  The dashboard is running locally, but Tailscale refused to write"
+    echo "  serve config because $(id -un) is not the tailscaled operator."
+    echo
+    echo "  Run this once:"
+    echo "      sudo tailscale set --operator=$(id -un)"
+    echo
+    echo "  Then re-run:"
+    echo "      $(rerun_command)"
+elif [[ "$funnel_failure" == "disabled" ]]; then
+    enable_url="$(grep -oE 'https://login\.tailscale\.com/[^[:space:]]+' "$FUNNEL_OUT" 2>/dev/null | head -n 1 || true)"
+    echo
+    echo "  The dashboard is running, and auth is on, but it is only reachable"
+    echo "  from this machine until Funnel is enabled."
+    echo
+    echo "  Enable Funnel here, then re-run:"
+    if [[ -n "$enable_url" ]]; then
+        printf '      %s\n' "$enable_url"
+    else
+        printf '      https://login.tailscale.com/admin/machines\n'
+        printf '      (Tailscale admin console → DNS → enable MagicDNS + HTTPS certificates,\n'
+        printf '       then enable Funnel for this node.)\n'
+    fi
+    echo
+    echo "  You may also need MagicDNS + HTTPS certificates enabled:"
+    echo "      https://login.tailscale.com/admin/dns"
+    echo
+    echo "  Re-run after enabling:"
+    echo "      $(rerun_command)"
+else
+    echo
+    echo "  The dashboard is running locally, but Funnel setup failed."
+    echo "  See the Tailscale output above."
+    echo
+    echo "  Re-run:"
+    echo "      $(rerun_command)"
+fi
+
+if [[ "$GENERATED_PASSWORD" -eq 1 ]]; then
+    echo
+    warn "A new basic-auth password was generated. Save it now — it is stored in:"
+    warn "  $ENV_FILE"
+fi
+
+echo
+echo "  ⚠ Funnel is public. Anyone with the URL reaches the login page."
+echo "    Keep the password private and stop the service with:"
+echo "      systemctl --user disable --now $UNIT_NAME"
+echo
