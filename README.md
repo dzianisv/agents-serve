@@ -20,6 +20,12 @@ default; pass names to install a subset.
 Each installed service is reachable at `http://<tailnet-ip>:<port>` once the
 node is on your tailnet — no manual IP configuration needed.
 
+For the Hermes **browser dashboard** on a public HTTPS URL (loopback bind +
+password auth + Tailscale Funnel), use the standalone installer in
+[Hermes dashboard over Tailscale Funnel](#hermes-dashboard-over-tailscale-funnel).
+It is not part of `install.sh`, and it shares port `9119` with the `hermes`
+service.
+
 ## Install
 
 ```bash
@@ -209,17 +215,75 @@ systemctl --user edit opencode-serve      # add [Service] Environment=OPENCODE_S
 # macOS: add to the plist's EnvironmentVariables dict, then reload
 ```
 
+## Hermes dashboard over Tailscale Funnel
+
+The `hermes` service above binds Hermes' server to the **tailnet** IP. If you
+want the **browser dashboard** instead — loopback bind, password auth forced on,
+and a public HTTPS URL via Tailscale Funnel — use the standalone installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash
+```
+
+It is **Linux / systemd --user only** and:
+
+1. installs `hermes-dashboard.service`, bound to `127.0.0.1:9119`;
+2. sets `HERMES_DASHBOARD_PUBLIC_URL` to the Funnel hostname, which forces
+   Hermes' auth gate on (the proxy connects from loopback, so without it the
+   dashboard would be unauthenticated);
+3. generates a basic-auth password and writes it with the public URL to
+   `~/.hermes/dashboard-funnel.env` (mode `600`);
+4. runs `tailscale funnel --bg --https=443 http://127.0.0.1:9119`;
+5. prints the public URL, or the Tailscale admin link to enable Funnel.
+
+Manage it with the same one-liner:
+
+```bash
+# status / login URL / funnel state
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --status
+
+# print the login credentials
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --show-password
+
+# rotate the generated password
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --reset-password
+
+# stop and remove the service + funnel mount
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --remove
+```
+
+Prerequisites:
+
+- Tailscale is up and MagicDNS + HTTPS certificates are enabled.
+- Funnel is enabled once in the tailnet admin console. The installer prints the
+  enable link when it isn't.
+- The CLI needs a one-time operator grant to write Serve/Funnel config without
+  sudo:
+  ```bash
+  sudo tailscale set --operator=$USER
+  ```
+
+> **Port conflict:** the dashboard service uses `127.0.0.1:9119`, the same
+> default port as `hermes-serve.service`. Install only one of them, or pass
+> `--port` to the dashboard installer.
+
+> **Restarts:** Hermes can take up to a minute to boot on a cold dependency
+> check, and Funnel returns `502` while the backend is down. Re-running the
+> installer is idempotent: it leaves a healthy, unchanged service running.
+
 ## Secrets
 
 `opencode-serve` and `paperclip-serve` each generate their own secrets once and
-persist them locally (mode 600); `hermes` manages its own auth outside this
-repo's control.
+persist them locally (mode 600); `hermes-serve` manages its own auth outside
+this repo's control. The dashboard installer generates a basic-auth password
+and writes it to `~/.hermes/dashboard-funnel.env` (mode 600).
 
 | File                          | Contents                                    |
 | ------------------------------ | -------------------------------------------- |
 | `~/.opencode-serve/env`        | `OPENCODE_SERVER_PASSWORD=<base64url 32B>`   |
 | `~/.opencode-serve/token`      | `<base64url 32B>`                            |
 | `~/.paperclip-serve/env`       | `PAPERCLIP_AGENT_JWT_SECRET=<base64url 32B>` |
+| `~/.hermes/dashboard-funnel.env` | dashboard public URL + basic-auth password |
 
 Generated once via `openssl rand -base64 32` (URL-safe). Delete them and
 restart the service to rotate.
@@ -307,6 +371,7 @@ agents-serve/
 ├── bin/opencode-session-offload           # local session archive wrapper
 ├── bin/paperclip-serve                    # paperclip wrapper: tailnet bind + exec paperclipai run
 ├── bin/hermes-serve                       # hermes wrapper: tailnet bind + exec hermes serve
+├── bin/hermes-dashboard-funnel            # standalone: loopback dashboard + auth + Tailscale Funnel
 └── templates/
     ├── opencode-serve.service             # systemd --user unit (opencode)
     ├── com.agents-serve.opencode.plist    # launchd LaunchAgent (opencode)
