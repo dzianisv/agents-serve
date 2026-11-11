@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# openclaw-dashboard-funnel
+#
+# Publish the OpenClaw Control UI (the Gateway dashboard) on the public
+# internet through Tailscale Funnel, protected by a generated gateway password.
+#
+# One-liner (Linux / systemd --user):
+#   curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash
+#
+# What it does
+#   1. Ensures the OpenClaw Gateway is installed and running on 127.0.0.1
+#   2. Switches gateway auth to password mode and stores the password in
+#      ~/.openclaw/.env as OPENCLAW_GATEWAY_PASSWORD
+#   3. Sets gateway.publicOrigin + gateway.trustedProxies so the Control UI
+#      accepts requests coming through the Funnel proxy
+#   4. Writes the public URL + credentials to
+#      ~/.openclaw/dashboard-funnel.env (mode 0600)
+#   5. Runs `tailscale funnel --bg --https=<port>` and prints the public URL
+#
+# IMPORTANT — Funnel is public
+#   The dashboard is an admin surface: chat, config, exec approvals. The only
+#   thing standing between the internet and this machine is the generated
+#   password. Keep the URL private and rotate the password with
+#   `--reset-password` if it leaks.
+#
+# Usage
+#   ./openclaw-dashboard-funnel                     # install / update / expose
+#   ./openclaw-dashboard-funnel --port 18789
+#   ./openclaw-dashboard-funnel --https-port 8443   # funnel: 443 | 8443 | 10000
+#   ./openclaw-dashboard-funnel --show-password     # print the login credentials
+#   ./openclaw-dashboard-funnel --reset-password    # rotate the generated password
+#   ./openclaw-dashboard-funnel --status
+#   ./openclaw-dashboard-funnel --remove
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+REPO_RAW="${AGENTS_SERVE_RAW:-https://raw.githubusercontent.com/dzianisv/agents-serve/main}"
+SELF_PATH="${BASH_SOURCE[0]:-}"
+if [[ -z "$SELF_PATH" || ! -f "$SELF_PATH" ]]; then
+    SELF_PATH=""  # piped via curl | bash; $0 is just "bash"
+fi
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+OPENCLAW_BIN="${OPENCLAW_BIN:-}"
+UNIT_NAME="openclaw-gateway.service"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
+ENV_FILE="$OPENCLAW_HOME/dashboard-funnel.env"
+DOTENV_FILE="$OPENCLAW_HOME/.env"
+CONFIG_FILE="$OPENCLAW_HOME/openclaw.json"
+
+PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+HTTPS_PORT="${OPENCLAW_FUNNEL_HTTPS_PORT:-}"
+USERNAME="${OPENCLAW_DASHBOARD_USER:-openclaw}"
+RESET_PASSWORD=0
+ACTION="install"
+FUNNEL_OUT=""
+HAVE_TAILSCALE=0
+CONFIG_BACKUP=""
+
+# ── output helpers ───────────────────────────────────────────────────────────
+info() { printf '→ %s\n' "$*"; }
+ok()   { printf '✓ %s\n' "$*"; }
+warn() { printf '⚠ %s\n' "$*" >&2; }
+die()  { printf '\n✗ %s\n' "$*" >&2; exit 1; }
+rule() { printf '─%.0s' $(seq 1 68); printf '\n'; }
+banner() {
+    echo "════════════════════════════════════════════════════════════════════"
+    printf ' %s\n' "$1"
+    echo "════════════════════════════════════════════════════════════════════"
+}
+
+cleanup() {
+    if [[ -n "$FUNNEL_OUT" && -f "$FUNNEL_OUT" ]]; then rm -f "$FUNNEL_OUT"; fi
+}
+trap cleanup EXIT
+
+usage() {
+    cat <<'USAGE'
+Usage: openclaw-dashboard-funnel [options]
+
+  --port N            Gateway port on 127.0.0.1 (default: 18789)
+  --https-port N      Funnel HTTPS port: 443 | 8443 | 10000
+                      (default: first free of 443, 8443, 10000)
+  --show-password     Print the dashboard login URL, username, and password
+  --reset-password    Rotate the generated gateway password
+  --status            Show service, local URL, funnel status, and credentials
+  --remove            Stop the funnel mount and remove the local env file
+  -h, --help          Show this help
+
+Examples:
+  ./openclaw-dashboard-funnel
+  ./openclaw-dashboard-funnel --https-port 8443
+  curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash
+  curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --status
+USAGE
+}
+
+# The command a user should run to retry (works both from a checkout and from
+# the curl | bash one-liner, where BASH_SOURCE is empty).
+rerun_command() {
+    if [[ -n "$SELF_PATH" ]]; then
+        printf '%s --port %s' "$SELF_PATH" "$PORT"
+        [[ -n "$HTTPS_PORT" ]] && printf ' --https-port %s' "$HTTPS_PORT"
+    else
+        printf 'curl -fsSL %s/bin/openclaw-dashboard-funnel | bash -s -- --port %s' \
+            "$REPO_RAW" "$PORT"
+        [[ -n "$HTTPS_PORT" ]] && printf ' --https-port %s' "$HTTPS_PORT"
+    fi
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+# Read a KEY=VALUE pair from an env file (last occurrence wins).
+env_get() {
+    local file="$1" key="$2" line=""
+    [[ -f "$file" ]] || return 0
+    line="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n 1 || true)"
+    [[ -n "$line" ]] || return 0
+    line="${line#*=}"
+    line="${line%$'\r'}"
+    if [[ "$line" == \"*\" && "$line" == *\" ]]; then
+        line="${line:1:${#line}-2}"
+    elif [[ "$line" == \'*\' && "$line" == *\' ]]; then
+        line="${line:1:${#line}-2}"
+    fi
+    printf '%s' "$line"
+}
+
+# Insert or replace KEY=VALUE in an env file, preserving everything else.
+# The file is created with mode 0600 when new.
+env_upsert() {
+    local file="$1" key="$2" value="$3"
+    python3 - "$file" "$key" "$value" <<'PY'
+import os, sys, tempfile
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = []
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+out, found = [], False
+for line in lines:
+    if line.startswith(key + "="):
+        out.append(f"{key}={value}")
+        found = True
+    else:
+        out.append(line)
+if not found:
+    out.append(f"{key}={value}")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+os.write(fd, ("\n".join(out) + "\n").encode())
+os.close(fd)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+}
+
+gen_password() { openssl rand -base64 24 | tr -d '\n=' | tr '+/' '-_'; }
+
+# Print a value from openclaw.json without booting the OpenClaw runtime.
+# Missing paths print nothing.
+config_get() {
+    python3 - "$CONFIG_FILE" "$1" <<'PY'
+import json, sys
+path, dotted = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        node = json.load(fh)
+except Exception:
+    sys.exit(0)
+for part in dotted.split("."):
+    if not isinstance(node, dict) or part not in node:
+        sys.exit(0)
+    node = node[part]
+if isinstance(node, bool):
+    print("true" if node else "false")
+elif isinstance(node, (dict, list)):
+    print(json.dumps(node))
+elif node is not None:
+    print(node)
+PY
+}
+
+# ── arguments ────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)
+            [[ $# -ge 2 ]] || die "--port needs a value"
+            PORT="$2"; shift 2 ;;
+        --https-port)
+            [[ $# -ge 2 ]] || die "--https-port needs a value"
+            HTTPS_PORT="$2"; shift 2 ;;
+        --show-password) ACTION="show-password"; shift ;;
+        --reset-password) RESET_PASSWORD=1; shift ;;
+        --status) ACTION="status"; shift ;;
+        --remove) ACTION="remove"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "Unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) \
+    || die "--port must be an integer between 1 and 65535"
+if [[ -n "$HTTPS_PORT" ]]; then
+    case "$HTTPS_PORT" in
+        443|8443|10000) ;;
+        *) die "--https-port must be 443, 8443, or 10000 (Tailscale Funnel restriction)" ;;
+    esac
+fi
+
+# ── preflight ────────────────────────────────────────────────────────────────
+need systemctl
+need python3
+need curl
+if [[ "$ACTION" != "remove" ]]; then
+    need tailscale
+    need jq
+    need openssl
+elif command -v tailscale >/dev/null 2>&1; then
+    HAVE_TAILSCALE=1
+else
+    HAVE_TAILSCALE=0
+fi
+
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if ! systemctl --user show-environment >/dev/null 2>&1; then
+        die "systemd --user is not reachable. Log in as $(id -un) and retry (or set XDG_RUNTIME_DIR=/run/user/$(id -u))."
+    fi
+fi
+
+# Resolve a working OpenClaw launcher. A stale shim can exist on PATH, so
+# validate each candidate with --version and fall through to the next.
+resolve_openclaw_bin() {
+    local candidate
+    for candidate in \
+        "$OPENCLAW_BIN" \
+        "$(command -v openclaw 2>/dev/null || true)" \
+        "$HOME/.local/bin/openclaw" \
+        "$OPENCLAW_HOME/runtime/node_modules/.bin/openclaw"; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if timeout 30 "$candidate" --version >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── tailnet identity ─────────────────────────────────────────────────────────
+if [[ "$ACTION" != "remove" ]]; then
+    tailscale status >/dev/null 2>&1 \
+        || die "Tailscale is not running or not logged in. Run: tailscale up"
+
+    TS_JSON="$(tailscale status --json 2>/dev/null)" \
+        || die "Could not read Tailscale status"
+    DNS_NAME="$(jq -r '.Self.DNSName // ""' <<<"$TS_JSON" | sed 's/\.$//')"
+    [[ -n "$DNS_NAME" ]] \
+        || die "Tailscale has no MagicDNS name for this node. Enable MagicDNS + HTTPS certificates in the Tailscale admin console, then retry."
+
+    # Pick a Funnel HTTPS port when the user did not pass one. Tailscale only
+    # allows 443, 8443, and 10000; reusing a port already proxied to a
+    # different backend would silently break that service.
+    if [[ -z "$HTTPS_PORT" ]]; then
+        for candidate in 443 8443 10000; do
+            existing="$(tailscale serve status --json 2>/dev/null \
+                | jq -r --arg host "$DNS_NAME:$candidate" '.Web[$host].Handlers["/"].Proxy // empty' 2>/dev/null || true)"
+            if [[ -z "$existing" || "$existing" == "http://127.0.0.1:$PORT" ]]; then
+                HTTPS_PORT="$candidate"
+                break
+            fi
+        done
+        [[ -n "$HTTPS_PORT" ]] \
+            || die "All Funnel HTTPS ports (443, 8443, 10000) are already in use on this node. Free one or pass --https-port after moving the other service."
+    fi
+
+    if [[ "$HTTPS_PORT" == "443" ]]; then
+        FUNNEL_URL="https://$DNS_NAME"
+    else
+        FUNNEL_URL="https://$DNS_NAME:$HTTPS_PORT"
+    fi
+fi
+
+# ── status ───────────────────────────────────────────────────────────────────
+if [[ "$ACTION" == "status" ]]; then
+    funnel_allow="false"
+    if funnel_json="$(tailscale funnel status --json 2>/dev/null)"; then
+        funnel_allow="$(jq -r --arg host "$DNS_NAME:$HTTPS_PORT" '.AllowFunnel[$host] // false' <<<"$funnel_json" 2>/dev/null || true)"
+    fi
+
+    echo
+    echo "OpenClaw dashboard funnel status"
+    rule
+    printf 'Service:      %s\n' "$UNIT_NAME"
+    printf 'Unit file:    %s\n' "$UNIT_PATH"
+    printf 'Env file:     %s\n' "$ENV_FILE"
+    printf 'Local URL:    http://127.0.0.1:%s\n' "$PORT"
+    if [[ "$funnel_allow" == "true" ]]; then
+        printf 'Public URL:   %s\n' "$FUNNEL_URL"
+    else
+        printf 'Public URL:   %s  (pending; Funnel not enabled)\n' "$FUNNEL_URL"
+    fi
+
+    if [[ -f "$UNIT_PATH" ]]; then
+        printf 'systemd:      %s\n' "$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)"
+    else
+        printf 'systemd:      not installed\n'
+    fi
+
+    local_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 "http://127.0.0.1:$PORT/" 2>/dev/null || true)"
+    printf 'HTTP /:       %s\n' "${local_code:-unreachable}"
+    printf 'Auth mode:    %s\n' "$(config_get gateway.auth.mode || true)"
+
+    echo
+    echo "Tailscale funnel config:"
+    tailscale funnel status 2>&1 | sed 's/^/  /' || true
+
+    echo
+    printf 'Username:     %s\n' "$(env_get "$ENV_FILE" OPENCLAW_DASHBOARD_USERNAME || true)"
+    printf 'Credentials:  %s\n' "$ENV_FILE"
+    exit 0
+fi
+
+# ── show-password ────────────────────────────────────────────────────────────
+if [[ "$ACTION" == "show-password" ]]; then
+    env_user="$(env_get "$ENV_FILE" OPENCLAW_DASHBOARD_USERNAME)"
+    env_pass="$(env_get "$ENV_FILE" OPENCLAW_GATEWAY_PASSWORD)"
+    [[ -n "$env_pass" ]] || env_pass="$(env_get "$DOTENV_FILE" OPENCLAW_GATEWAY_PASSWORD)"
+    echo
+    printf 'URL:      %s/\n' "$FUNNEL_URL"
+    printf 'Username: %s\n' "${env_user:-$USERNAME}"
+    if [[ -n "$env_pass" ]]; then
+        printf 'Password: %s\n' "$env_pass"
+    else
+        printf 'Password: (not found in %s or %s)\n' "$ENV_FILE" "$DOTENV_FILE"
+    fi
+    exit 0
+fi
+
+# ── remove ───────────────────────────────────────────────────────────────────
+if [[ "$ACTION" == "remove" ]]; then
+    if [[ -z "$HTTPS_PORT" ]]; then
+        HTTPS_PORT="$(env_get "$ENV_FILE" OPENCLAW_FUNNEL_HTTPS_PORT)"
+    fi
+    if [[ -z "$HTTPS_PORT" ]]; then
+        HTTPS_PORT=443
+    fi
+
+    info "Removing any Funnel mount on https/$HTTPS_PORT"
+    if [[ "$HAVE_TAILSCALE" -eq 1 ]]; then
+        timeout 10 tailscale funnel --https="$HTTPS_PORT" off >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$ENV_FILE"
+    ok "Removed the Funnel mount and $ENV_FILE"
+    echo "  The Gateway is still running locally with password auth."
+    echo "  To return to token auth, run:"
+    echo "    openclaw config set gateway.auth.mode token"
+    echo "    openclaw config set gateway.auth.token '\${OPENCLAW_GATEWAY_TOKEN}'"
+    exit 0
+fi
+
+# ── resolve launcher + check the port ────────────────────────────────────────
+OPENCLAW_BIN="$(resolve_openclaw_bin || true)"
+[[ -n "$OPENCLAW_BIN" ]] \
+    || die "No working openclaw CLI found. Install OpenClaw first, or set OPENCLAW_BIN=/path/to/openclaw."
+ok "Using openclaw launcher: $OPENCLAW_BIN"
+
+if systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+    :
+elif command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$PORT" 2>/dev/null | grep -q .; then
+    die "Port $PORT is already in use by a process that is not $UNIT_NAME. Stop it, or re-run with --port <free-port>."
+fi
+
+# ── pick auth material ───────────────────────────────────────────────────────
+ENV_USER="$(env_get "$ENV_FILE" OPENCLAW_DASHBOARD_USERNAME)"
+ENV_PASS="$(env_get "$ENV_FILE" OPENCLAW_GATEWAY_PASSWORD)"
+DOTENV_PASS="$(env_get "$DOTENV_FILE" OPENCLAW_GATEWAY_PASSWORD)"
+
+USERNAME="${ENV_USER:-$USERNAME}"
+GENERATED_PASSWORD=0
+
+if [[ "$RESET_PASSWORD" -eq 0 && -n "$DOTENV_PASS" ]]; then
+    PASSWORD="$DOTENV_PASS"
+elif [[ "$RESET_PASSWORD" -eq 0 && -n "$ENV_PASS" ]]; then
+    PASSWORD="$ENV_PASS"
+else
+    PASSWORD="$(gen_password)"
+    GENERATED_PASSWORD=1
+fi
+
+# ── lingering ────────────────────────────────────────────────────────────────
+linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+if [[ "$linger" != "yes" ]]; then
+    if loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
+        ok "Enabled systemd lingering (starts at boot without a login)"
+    else
+        warn "Could not enable linger; the service will only run while you are logged in."
+        warn "Run: sudo loginctl enable-linger $(id -un)"
+    fi
+fi
+
+# ── install the Gateway service if needed ────────────────────────────────────
+if ! systemctl --user cat "$UNIT_NAME" >/dev/null 2>&1; then
+    info "Installing $UNIT_NAME on port $PORT"
+    "$OPENCLAW_BIN" gateway install --port "$PORT" \
+        || die "openclaw gateway install failed. Install the Gateway manually, then re-run."
+    systemctl --user cat "$UNIT_NAME" >/dev/null 2>&1 \
+        || die "Gateway service was not created at $UNIT_PATH."
+fi
+
+# ── does the config already match? ───────────────────────────────────────────
+# Re-writing openclaw.json while the Gateway is starting makes it queue a
+# reload/restart; on a custom runtime pin that restart can stop the service
+# without starting it again. So only touch the config when a value differs.
+CONFIG_CURRENT=0
+if [[ "$(config_get gateway.auth.mode)" == "password" \
+   && "$(config_get gateway.publicOrigin)" == "$FUNNEL_URL" \
+   && "$(config_get gateway.auth.password)" == '${OPENCLAW_GATEWAY_PASSWORD}' \
+   && "$(config_get gateway.trustedProxies)" == *"127.0.0.1"* \
+   && "$(config_get gateway.controlUi.allowedOrigins)" == *"$FUNNEL_URL"* ]]; then
+    CONFIG_CURRENT=1
+fi
+
+DOTENV_PASS_CURRENT="$(env_get "$DOTENV_FILE" OPENCLAW_GATEWAY_PASSWORD)"
+NEEDS_CONFIG=0
+NEEDS_RESTART=0
+[[ "$CONFIG_CURRENT" -eq 1 ]] || NEEDS_CONFIG=1
+[[ "$DOTENV_PASS_CURRENT" == "$PASSWORD" ]] || NEEDS_RESTART=1
+
+# ── apply config (only when it differs) ──────────────────────────────────────
+if [[ "$NEEDS_CONFIG" -eq 1 ]]; then
+    # OpenClaw writes config through the running Gateway (config.patch). An auth
+    # change closes that connection before the write lands, so apply the batch
+    # with the service stopped.
+    info "Stopping $UNIT_NAME to apply gateway auth/config"
+    systemctl --user stop "$UNIT_NAME"
+    for _ in $(seq 1 60); do
+        if ! curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/health" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    CONFIG_BACKUP="$OPENCLAW_HOME/openclaw.json.bak-dashboard-funnel-$(date -u +%Y%m%dT%H%M%SZ)"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp -a "$CONFIG_FILE" "$CONFIG_BACKUP"
+        ok "Backed up config: $CONFIG_BACKUP"
+    fi
+
+    BATCH_JSON="$(python3 - "$FUNNEL_URL" "$PORT" <<'PY'
+import json, sys
+url, port = sys.argv[1], sys.argv[2]
+print(json.dumps([
+    {"path": "gateway.auth.mode", "value": "password"},
+    {"path": "gateway.auth.password", "value": "${OPENCLAW_GATEWAY_PASSWORD}"},
+    {"path": "gateway.publicOrigin", "value": url},
+    {"path": "gateway.trustedProxies", "value": ["127.0.0.1"]},
+    {"path": "gateway.controlUi.allowedOrigins", "value": [
+        url,
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+    ]},
+]))
+PY
+)"
+
+    set +e
+    "$OPENCLAW_BIN" config set --batch-json "$BATCH_JSON" --strict-json >/tmp/openclaw-funnel-config.$$ 2>&1
+    cfg_rc=$?
+    set -e
+    if [[ -s "/tmp/openclaw-funnel-config.$$" ]]; then
+        sed 's/^/  /' "/tmp/openclaw-funnel-config.$$"
+    fi
+    rm -f "/tmp/openclaw-funnel-config.$$"
+
+    if [[ "$cfg_rc" -ne 0 ]]; then
+        warn "Config update failed; restoring $CONFIG_BACKUP"
+        [[ -f "$CONFIG_BACKUP" ]] && cp -a "$CONFIG_BACKUP" "$CONFIG_FILE"
+        systemctl --user start "$UNIT_NAME" >/dev/null 2>&1 || true
+        die "Could not apply gateway config. The previous config was restored."
+    fi
+else
+    ok "Gateway config already matches; not rewriting openclaw.json"
+fi
+
+# ── write credentials ────────────────────────────────────────────────────────
+umask 077
+mkdir -p "$OPENCLAW_HOME"
+if [[ "$DOTENV_PASS_CURRENT" != "$PASSWORD" ]]; then
+    env_upsert "$DOTENV_FILE" OPENCLAW_GATEWAY_PASSWORD "$PASSWORD"
+fi
+env_upsert "$ENV_FILE" OPENCLAW_DASHBOARD_URL "$FUNNEL_URL"
+env_upsert "$ENV_FILE" OPENCLAW_DASHBOARD_USERNAME "$USERNAME"
+env_upsert "$ENV_FILE" OPENCLAW_GATEWAY_PASSWORD "$PASSWORD"
+env_upsert "$ENV_FILE" OPENCLAW_FUNNEL_HTTPS_PORT "$HTTPS_PORT"
+chmod 600 "$DOTENV_FILE" "$ENV_FILE" 2>/dev/null || true
+ok "Wrote $ENV_FILE (0600)"
+
+# ── start or restart the Gateway ─────────────────────────────────────────────
+if [[ "$NEEDS_CONFIG" -eq 1 || "$NEEDS_RESTART" -eq 1 ]]; then
+    info "Starting $UNIT_NAME on 127.0.0.1:$PORT"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user restart "$UNIT_NAME"
+elif ! systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+    info "Starting $UNIT_NAME on 127.0.0.1:$PORT"
+    systemctl --user start "$UNIT_NAME"
+else
+    ok "Gateway is already running; no restart needed"
+fi
+
+# A cold Gateway boot takes 50–90s here, and /health can briefly flap while the
+# plugins and sidecars settle. Poll for a stable window (3 consecutive 200s)
+# instead of trusting the first successful response.
+gateway_ready=0
+consecutive_ok=0
+deadline=$((SECONDS + 300))
+while (( SECONDS < deadline )); do
+    if systemctl --user is-failed --quiet "$UNIT_NAME" 2>/dev/null; then
+        break
+    fi
+    if ! systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+        systemctl --user start "$UNIT_NAME" >/dev/null 2>&1 || true
+        sleep 2
+        continue
+    fi
+    if [[ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)" == "200" ]]; then
+        consecutive_ok=$((consecutive_ok + 1))
+        if [[ "$consecutive_ok" -ge 3 ]]; then
+            gateway_ready=1
+            break
+        fi
+    else
+        consecutive_ok=0
+    fi
+    sleep 2
+done
+
+if [[ "$gateway_ready" -ne 1 ]]; then
+    warn "Gateway did not become ready. Recent service output:"
+    journalctl --user -u "$UNIT_NAME" -n 50 --no-pager 2>/dev/null || true
+    if [[ -n "$CONFIG_BACKUP" && -f "$CONFIG_BACKUP" ]]; then
+        warn "Restoring $CONFIG_BACKUP"
+        cp -a "$CONFIG_BACKUP" "$CONFIG_FILE"
+        systemctl --user restart "$UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+    die "Gateway failed to start. See the log output above."
+fi
+ok "Gateway is up (localhost only)"
+
+# ── configure Tailscale Funnel ───────────────────────────────────────────────
+existing_proxy="$(tailscale serve status --json 2>/dev/null \
+    | jq -r --arg host "$DNS_NAME:$HTTPS_PORT" '.Web[$host].Handlers["/"].Proxy // empty' 2>/dev/null || true)"
+if [[ -n "$existing_proxy" && "$existing_proxy" != "http://127.0.0.1:$PORT" ]]; then
+    die "https/$HTTPS_PORT already serves $existing_proxy on this node. Re-run with --https-port <443|8443|10000> after moving that service."
+fi
+
+info "Configuring Tailscale Funnel on https/$HTTPS_PORT → http://127.0.0.1:$PORT"
+FUNNEL_OUT="$(mktemp "${TMPDIR:-/tmp}/openclaw-funnel.XXXXXX")"
+set +e
+timeout 25 tailscale funnel --bg --yes --https="$HTTPS_PORT" "http://127.0.0.1:$PORT" >"$FUNNEL_OUT" 2>&1
+funnel_rc=$?
+set -e
+
+if [[ -s "$FUNNEL_OUT" ]]; then
+    sed 's/^/  /' "$FUNNEL_OUT"
+    echo
+fi
+
+funnel_configured=0
+funnel_allow="false"
+if funnel_json="$(tailscale funnel status --json 2>/dev/null)"; then
+    funnel_allow="$(jq -r --arg host "$DNS_NAME:$HTTPS_PORT" '.AllowFunnel[$host] // false' <<<"$funnel_json" 2>/dev/null || true)"
+fi
+if [[ "$funnel_allow" == "true" ]]; then
+    funnel_configured=1
+elif [[ "$funnel_rc" -eq 0 ]] && tailscale funnel status 2>/dev/null | grep -qF "http://127.0.0.1:$PORT"; then
+    funnel_configured=1
+fi
+
+funnel_failure="none"
+if [[ "$funnel_configured" -ne 1 ]]; then
+    if grep -qiE 'Access denied|operator' "$FUNNEL_OUT" 2>/dev/null; then
+        funnel_failure="operator"
+    elif grep -qiE 'not enabled|login\.tailscale\.com/f/funnel' "$FUNNEL_OUT" 2>/dev/null; then
+        funnel_failure="disabled"
+    else
+        funnel_failure="other"
+    fi
+fi
+
+# ── report ───────────────────────────────────────────────────────────────────
+echo
+if [[ "$funnel_configured" -eq 1 ]]; then
+    banner "OpenClaw dashboard is live on the public internet"
+elif [[ "$funnel_failure" == "operator" ]]; then
+    banner "Tailscale needs a one-time operator grant"
+elif [[ "$funnel_failure" == "disabled" ]]; then
+    banner "Funnel is NOT enabled on your tailnet yet"
+else
+    banner "Funnel configuration failed"
+fi
+
+printf '  Local URL:     http://127.0.0.1:%s\n' "$PORT"
+if [[ "$funnel_configured" -eq 1 ]]; then
+    printf '  Public URL:    %s/\n' "$FUNNEL_URL"
+else
+    printf '  Funnel URL:    %s/  (not live)\n' "$FUNNEL_URL"
+fi
+printf '  Service:       %s (systemd --user)\n' "$UNIT_NAME"
+printf '  Logs:          journalctl --user -u %s -f\n' "$UNIT_NAME"
+printf '  Env file:      %s\n' "$ENV_FILE"
+printf '  Username:      %s (the UI only asks for the password)\n' "$USERNAME"
+printf '  Password:      %s\n' "$PASSWORD"
+
+if [[ "$funnel_configured" -eq 1 ]]; then
+    echo
+    info "Waiting for the public URL to answer (TLS cert may take a few seconds)…"
+    http_code=""
+    for _ in $(seq 1 15); do
+        http_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "$FUNNEL_URL/" 2>/dev/null || true)"
+        [[ "$http_code" == "200" ]] && break
+        sleep 2
+    done
+    if [[ "$http_code" == "200" ]]; then
+        ok "Public URL is answering with HTTP 200 at $FUNNEL_URL/"
+    else
+        warn "Public URL did not answer yet (got '${http_code:-no response}')."
+        warn "The TLS certificate may still be provisioning; retry in ~30 seconds."
+    fi
+    echo
+    echo "  Share/login page: $FUNNEL_URL/"
+elif [[ "$funnel_failure" == "operator" ]]; then
+    echo
+    echo "  The dashboard is running locally, but Tailscale refused to write"
+    echo "  serve config because $(id -un) is not the tailscaled operator."
+    echo
+    echo "  Run this once:"
+    echo "      sudo tailscale set --operator=$(id -un)"
+    echo
+    echo "  Then re-run:"
+    echo "      $(rerun_command)"
+elif [[ "$funnel_failure" == "disabled" ]]; then
+    enable_url="$(grep -oE 'https://login\.tailscale\.com/[^[:space:]]+' "$FUNNEL_OUT" 2>/dev/null | head -n 1 || true)"
+    echo
+    echo "  The dashboard is running, and auth is on, but it is only reachable"
+    echo "  from this machine until Funnel is enabled."
+    echo
+    echo "  Enable Funnel here, then re-run:"
+    if [[ -n "$enable_url" ]]; then
+        printf '      %s\n' "$enable_url"
+    else
+        printf '      https://login.tailscale.com/admin/machines\n'
+        printf '      (Tailscale admin console → DNS → enable MagicDNS + HTTPS certificates,\n'
+        printf '       then enable Funnel for this node.)\n'
+    fi
+    echo
+    echo "  You may also need MagicDNS + HTTPS certificates enabled:"
+    echo "      https://login.tailscale.com/admin/dns"
+    echo
+    echo "  Re-run after enabling:"
+    echo "      $(rerun_command)"
+else
+    echo
+    echo "  The dashboard is running locally, but Funnel setup failed."
+    echo "  See the Tailscale output above."
+    echo
+    echo "  Re-run:"
+    echo "      $(rerun_command)"
+fi
+
+if [[ "$GENERATED_PASSWORD" -eq 1 ]]; then
+    echo
+    warn "A new gateway password was generated. Save it now — it is stored in:"
+    warn "  $ENV_FILE"
+fi
+
+echo
+echo "  ⚠ Funnel is public. Anyone with the URL reaches the dashboard login."
+echo "    The Gateway is password-protected, but treat the URL as sensitive."
+echo "    Rotate with: $(rerun_command | sed 's/$/ --reset-password/')"
+echo "    Stop with:   systemctl --user disable --now $UNIT_NAME"
+echo "                 tailscale funnel --https=$HTTPS_PORT off"
+echo

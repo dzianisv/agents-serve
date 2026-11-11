@@ -26,6 +26,12 @@ password auth + Tailscale Funnel), use the standalone installer in
 It is not part of `install.sh`, and it shares port `9119` with the `hermes`
 service.
 
+For the **OpenClaw Control UI** on a public HTTPS URL (loopback bind + gateway
+password auth + Tailscale Funnel), use
+[OpenClaw dashboard over Tailscale Funnel](#openclaw-dashboard-over-tailscale-funnel).
+It is also standalone and can run alongside the Hermes dashboard on a different
+Funnel HTTPS port.
+
 ## Install
 
 ```bash
@@ -271,12 +277,77 @@ Prerequisites:
 > check, and Funnel returns `502` while the backend is down. Re-running the
 > installer is idempotent: it leaves a healthy, unchanged service running.
 
+## OpenClaw dashboard over Tailscale Funnel
+
+The OpenClaw Gateway serves its Control UI (the dashboard) on
+`127.0.0.1:18789`. To publish that dashboard on a public HTTPS URL, protected by
+a generated gateway password, use the standalone installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash
+```
+
+It is **Linux / systemd --user only** and:
+
+1. ensures `openclaw-gateway.service` exists and listens on `127.0.0.1:18789`;
+2. switches `gateway.auth.mode` to `password` and stores the generated secret in
+   `~/.openclaw/.env` as `OPENCLAW_GATEWAY_PASSWORD`;
+3. sets `gateway.publicOrigin`, `gateway.trustedProxies` and
+   `gateway.controlUi.allowedOrigins` so the Control UI accepts traffic from the
+   Funnel proxy (which connects over loopback);
+4. writes the public URL + credentials to `~/.openclaw/dashboard-funnel.env`
+   (mode `600`);
+5. runs `tailscale funnel --bg --https=<port> http://127.0.0.1:18789` and prints
+   the public URL.
+
+The installer picks the first free Funnel HTTPS port (`443`, `8443`, `10000`),
+so it can run alongside a Hermes dashboard already using `443` without stealing
+its route. Pass `--https-port` to force one.
+
+Manage it with the same one-liner:
+
+```bash
+# status / public URL / funnel state
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --status
+
+# print the login credentials
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --show-password
+
+# rotate the generated password
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --reset-password
+
+# stop the funnel mount and remove the local env file
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --remove
+```
+
+Prerequisites:
+
+- Tailscale is up and MagicDNS + HTTPS certificates are enabled.
+- Funnel is enabled once in the tailnet admin console. The installer prints the
+  enable link when it isn't.
+- The CLI needs a one-time operator grant to write Serve/Funnel config without
+  sudo:
+  ```bash
+  sudo tailscale set --operator=$USER
+  ```
+
+> **Auth:** the Control UI has no username field. The installer prints
+> `openclaw` as a display name; the actual login is the generated gateway
+> password (enter it in **Gateway secret** on the login screen).
+
+> **Security:** Funnel is public, and the Control UI is an admin surface (chat,
+> config, exec approvals). The password is the only gate. Keep the URL private
+> and rotate the password if it leaks.
+
 ## Secrets
 
 `opencode-serve` and `paperclip-serve` each generate their own secrets once and
 persist them locally (mode 600); `hermes-serve` manages its own auth outside
-this repo's control. The dashboard installer generates a basic-auth password
-and writes it to `~/.hermes/dashboard-funnel.env` (mode 600).
+this repo's control. The Hermes dashboard installer generates a basic-auth
+password and writes it to `~/.hermes/dashboard-funnel.env` (mode 600). The
+OpenClaw dashboard installer generates a gateway password and writes it to
+`~/.openclaw/dashboard-funnel.env` (mode 600), with the same value in
+`~/.openclaw/.env` so the Gateway can resolve it at startup.
 
 | File                          | Contents                                    |
 | ------------------------------ | -------------------------------------------- |
@@ -284,6 +355,8 @@ and writes it to `~/.hermes/dashboard-funnel.env` (mode 600).
 | `~/.opencode-serve/token`      | `<base64url 32B>`                            |
 | `~/.paperclip-serve/env`       | `PAPERCLIP_AGENT_JWT_SECRET=<base64url 32B>` |
 | `~/.hermes/dashboard-funnel.env` | dashboard public URL + basic-auth password |
+| `~/.openclaw/dashboard-funnel.env` | OpenClaw public URL + gateway password |
+| `~/.openclaw/.env`             | `OPENCLAW_GATEWAY_PASSWORD=<generated>`     |
 
 Generated once via `openssl rand -base64 32` (URL-safe). Delete them and
 restart the service to rotate.
@@ -372,6 +445,7 @@ agents-serve/
 ├── bin/paperclip-serve                    # paperclip wrapper: tailnet bind + exec paperclipai run
 ├── bin/hermes-serve                       # hermes wrapper: tailnet bind + exec hermes serve
 ├── bin/hermes-dashboard-funnel            # standalone: loopback dashboard + auth + Tailscale Funnel
+├── bin/openclaw-dashboard-funnel          # standalone: OpenClaw Control UI + gateway password + Funnel
 └── templates/
     ├── opencode-serve.service             # systemd --user unit (opencode)
     ├── com.agents-serve.opencode.plist    # launchd LaunchAgent (opencode)
