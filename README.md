@@ -25,6 +25,18 @@ to install a subset.
 the node is on your tailnet. `hermes` and `openclaw` follow whatever their own
 service managers do — see [Native service managers](#native-service-managers-hermes--openclaw).
 
+For the Hermes **browser dashboard** on a public HTTPS URL (loopback bind +
+password auth + Tailscale Funnel), use the standalone installer in
+[Hermes dashboard over Tailscale Funnel](#hermes-dashboard-over-tailscale-funnel).
+It is not part of `install.sh`; its dashboard listener uses port `9119` by
+default. Use `--port` if that port is already occupied.
+
+For the **OpenClaw Control UI** on a public HTTPS URL (loopback bind + gateway
+password auth + Tailscale Funnel), use
+[OpenClaw dashboard over Tailscale Funnel](#openclaw-dashboard-over-tailscale-funnel).
+It is also standalone and can run alongside the Hermes dashboard on a different
+Funnel HTTPS port.
+
 ## Install
 
 ```bash
@@ -143,10 +155,10 @@ openclaw gateway install      # systemd --user / launchd, owned by openclaw
 
 Consequences worth knowing:
 
-- **Hermes dashboard has no service.** Upstream states plainly that "Hermes
-  never installs a service for `hermes dashboard` or `hermes serve`". This
-  installer therefore does not invent one: run `hermes dashboard` yourself
-  (tmux/systemd of your choice) if you need the web UI.
+- **Hermes dashboard is separate from its gateway.** Upstream does not provide
+  a service for `hermes dashboard` or `hermes serve`; the default installer
+  leaves it alone. The optional dashboard Funnel helper is documented
+  separately and manages that distinct dashboard process.
 - **OpenClaw's dashboard *is* the gateway.** The Control UI is served by the
   gateway process on the same port, so `openclaw gateway install` is all that
   is needed for a persistent dashboard.
@@ -280,18 +292,139 @@ systemctl --user edit opencode-serve      # add [Service] Environment=OPENCODE_S
 # macOS: add to the plist's EnvironmentVariables dict, then reload
 ```
 
+## Hermes dashboard over Tailscale Funnel
+
+The `hermes` service above binds Hermes' server to the **tailnet** IP. If you
+want the **browser dashboard** instead — loopback bind, password auth forced on,
+and a public HTTPS URL via Tailscale Funnel — use the standalone installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash
+```
+
+It is **Linux / systemd --user only** and:
+
+1. installs `hermes-dashboard.service`, bound to `127.0.0.1:9119`;
+2. sets `HERMES_DASHBOARD_PUBLIC_URL` to the Funnel hostname, which forces
+   Hermes' auth gate on (the proxy connects from loopback, so without it the
+   dashboard would be unauthenticated);
+3. generates a basic-auth password and writes it with the public URL to
+   `~/.hermes/dashboard-funnel.env` (mode `600`);
+4. runs `tailscale funnel --bg --https=443 http://127.0.0.1:9119`;
+5. prints the public URL, or the Tailscale admin link to enable Funnel.
+
+Manage it with the same one-liner:
+
+```bash
+# status / login URL / funnel state
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --status
+
+# print the login credentials
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --show-password
+
+# rotate the generated password
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --reset-password
+
+# stop and remove the service + funnel mount
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/hermes-dashboard-funnel | bash -s -- --remove
+```
+
+Prerequisites:
+
+- Tailscale is up and MagicDNS + HTTPS certificates are enabled.
+- Funnel is enabled once in the tailnet admin console. The installer prints the
+  enable link when it isn't.
+- The CLI needs a one-time operator grant to write Serve/Funnel config without
+  sudo:
+  ```bash
+  sudo tailscale set --operator=$USER
+  ```
+
+> **Port conflict:** the dashboard service uses `127.0.0.1:9119`, the same
+> default port as `hermes-serve.service`. Install only one of them, or pass
+> `--port` to the dashboard installer.
+
+> **Restarts:** Hermes can take up to a minute to boot on a cold dependency
+> check, and Funnel returns `502` while the backend is down. Re-running the
+> installer is idempotent: it leaves a healthy, unchanged service running.
+
+## OpenClaw dashboard over Tailscale Funnel
+
+The OpenClaw Gateway serves its Control UI (the dashboard) on
+`127.0.0.1:18789`. To publish that dashboard on a public HTTPS URL, protected by
+a generated gateway password, use the standalone installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash
+```
+
+It is **Linux / systemd --user only** and:
+
+1. ensures `openclaw-gateway.service` exists and listens on `127.0.0.1:18789`;
+2. switches `gateway.auth.mode` to `password` and stores the generated secret in
+   `~/.openclaw/.env` as `OPENCLAW_GATEWAY_PASSWORD`;
+3. sets `gateway.publicOrigin`, `gateway.trustedProxies` and
+   `gateway.controlUi.allowedOrigins` so the Control UI accepts traffic from the
+   Funnel proxy (which connects over loopback);
+4. writes the public URL + credentials to `~/.openclaw/dashboard-funnel.env`
+   (mode `600`);
+5. runs `tailscale funnel --bg --https=<port> http://127.0.0.1:18789` and prints
+   the public URL.
+
+The installer picks the first free Funnel HTTPS port (`443`, `8443`, `10000`),
+so it can run alongside a Hermes dashboard already using `443` without stealing
+its route. Pass `--https-port` to force one.
+
+Manage it with the same one-liner:
+
+```bash
+# status / public URL / funnel state
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --status
+
+# print the login credentials
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --show-password
+
+# rotate the generated password
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --reset-password
+
+# stop the funnel mount and remove the local env file
+curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/bin/openclaw-dashboard-funnel | bash -s -- --remove
+```
+
+Prerequisites:
+
+- Tailscale is up and MagicDNS + HTTPS certificates are enabled.
+- Funnel is enabled once in the tailnet admin console. The installer prints the
+  enable link when it isn't.
+- The CLI needs a one-time operator grant to write Serve/Funnel config without
+  sudo:
+  ```bash
+  sudo tailscale set --operator=$USER
+  ```
+
+> **Auth:** the Control UI has no username field. The installer prints
+> `openclaw` as a display name; the actual login is the generated gateway
+> password (enter it in **Gateway secret** on the login screen).
+
+> **Security:** Funnel is public, and the Control UI is an admin surface (chat,
+> config, exec approvals). The password is the only gate. Keep the URL private
+> and rotate the password if it leaks.
+
 ## Secrets
 
 `opencode-serve` and `paperclip-serve` each generate their own secrets once and
-persist them locally (mode 600); `hermes` and `openclaw` manage their own auth
-outside this repo's control.
+persist them locally (mode 600). Hermes and OpenClaw gateway authentication is
+managed by their upstream CLIs. The optional dashboard Funnel helpers also
+persist their access details locally, mode 600.
 
 | File                          | Contents                                    |
 | ------------------------------ | -------------------------------------------- |
 | `~/.opencode-serve/env`        | `OPENCODE_SERVER_PASSWORD=<base64url 32B>`   |
 | `~/.opencode-serve/token`      | `<base64url 32B>`                            |
 | `~/.paperclip-serve/env`       | `PAPERCLIP_AGENT_JWT_SECRET=<base64url 32B>` |
-| `~/.openclaw/.env`             | `OPENCLAW_GATEWAY_PASSWORD=<generated once>` (openclaw's own file) |
+| `~/.hermes/dashboard-funnel.env` | dashboard public URL + basic-auth password |
+| `~/.openclaw/dashboard-funnel.env` | OpenClaw public URL + gateway password |
+| `~/.openclaw/.env`             | `OPENCLAW_GATEWAY_PASSWORD=<generated once>` (OpenClaw's own file) |
 
 Generated once via `openssl rand -base64 32` (URL-safe). Delete them and
 restart the service to rotate. For OpenClaw, change the password in
@@ -382,12 +515,15 @@ agents-serve/
 ├── bin/opencode-cli                       # remote session lister + permission listener
 ├── bin/opencode-session-offload           # local session archive wrapper
 ├── bin/paperclip-serve                    # paperclip wrapper: tailnet bind + exec paperclipai run
-└── templates/                             # only for services with no native unit
+├── bin/hermes-dashboard-funnel            # standalone: loopback dashboard + auth + Tailscale Funnel
+├── bin/openclaw-dashboard-funnel          # standalone: OpenClaw Control UI + gateway password + Funnel
+└── templates/                             # units only for services without native managers
     ├── opencode-serve.service             # systemd --user unit (opencode)
     ├── com.agents-serve.opencode.plist    # launchd LaunchAgent (opencode)
     ├── paperclip-serve.service            # systemd --user unit (paperclip)
     └── com.agents-serve.paperclip.plist   # launchd LaunchAgent (paperclip)
 ```
 
-No `hermes-serve` / `openclaw` wrapper or template exists on purpose: both
-agents ship their own service manager, so a second unit would only fight it.
+No Hermes gateway or OpenClaw wrapper/unit template exists on purpose: both
+agents ship their own gateway service managers. The dashboard Funnel helpers
+are separate tools; see their sections above for their behavior.
