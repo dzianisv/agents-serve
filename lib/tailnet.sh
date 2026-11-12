@@ -1,9 +1,10 @@
 # shellcheck shell=bash
 # lib/tailnet.sh — shared helpers for agents-serve wrappers.
 #
-# Sourced by bin/opencode-serve, bin/paperclip-serve, bin/hermes-serve so all
-# three wrappers share one implementation of tailnet IP resolution, secret
-# generation, and logging instead of copy-pasting it three times.
+# Sourced by bin/opencode-serve and bin/paperclip-serve so both wrappers share
+# one implementation of tailnet IP resolution, secret generation, and logging
+# instead of copy-pasting it twice. (hermes and openclaw don't use it: they own
+# their own native services and bind settings.)
 #
 # Not meant to be executed directly. Callers are expected to:
 #   1. set LOG_TAG before calling log(), e.g. LOG_TAG="opencode-serve"

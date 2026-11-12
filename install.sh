@@ -6,20 +6,33 @@
 #   Linux : systemd --user services
 #   macOS : launchd LaunchAgents
 #
-# One-liner (installs ALL services: opencode, paperclip, hermes):
+# One-liner (installs ALL services: opencode, paperclip, hermes, openclaw):
 #   curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh | bash
 #
 # Selective install:
 #   curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh | bash -s -- opencode
 #   curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh | bash -s -- paperclip hermes
+#   curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh | bash -s -- openclaw
+#
+# Service units: this installer only writes a unit where upstream has none.
+# opencode and paperclip have no native service support, so they get
+# opencode-serve.service / paperclip-serve.service here. hermes and openclaw
+# both ship their own service manager (`hermes gateway install`,
+# `openclaw gateway install`) — this installer configures them and calls those,
+# it never hand-rolls a competing unit.
 #
 # Generic env overrides:
-#   AGENTS_SERVE_HOST     force bind host for ALL services (default: auto tailnet IP)
+#   AGENTS_SERVE_HOST     force bind host for opencode/paperclip (default: auto tailnet IP)
 #   AGENTS_SERVE_RAW      raw base URL to fetch files when piped
 #   OPENCODE_SERVE_RAW    back-compat alias for AGENTS_SERVE_RAW
 #   PREFIX                install prefix for wrappers/lib (default ~/.local)
 # Per-service overrides (host/port/etc.): see README.md
 set -euo pipefail
+
+# The native CLIs (openclaw, hermes, tailscale) usually live in ~/.local/bin or
+# an npm prefix. A piped `curl | bash` inherits a minimal PATH, so widen it
+# before any command lookup below.
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
 
 REPO_RAW="${AGENTS_SERVE_RAW:-${OPENCODE_SERVE_RAW:-https://raw.githubusercontent.com/dzianisv/agents-serve/main}}"
 PREFIX="${PREFIX:-$HOME/.local}"
@@ -313,67 +326,189 @@ install_hermes_upstream() {
 }
 
 install_hermes_wrapper() {
-  mkdir -p "$BIN_DIR"
-  fetch_to "bin/hermes-serve" "$BIN_DIR/hermes-serve"
-  chmod +x "$BIN_DIR/hermes-serve"
-  say "hermes wrapper installed -> $BIN_DIR/hermes-serve"
+  # Legacy: pre-native installs shipped a hermes-serve wrapper + hand-written
+  # unit. Hermes has owned its own service for a while (`hermes gateway
+  # install`), so the wrapper is gone. Clean up any leftover from an old
+  # install so it cannot keep binding the port next to the native unit.
+  rm -f "$BIN_DIR/hermes-serve"
+  if [ "$OS" = "Linux" ] && [ -f "$HOME/.config/systemd/user/hermes-serve.service" ]; then
+    warn "removing legacy hermes-serve.service (superseded by hermes gateway install)"
+    systemctl --user disable --now hermes-serve.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/hermes-serve.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+  if [ "$OS" = "Darwin" ] && [ -f "$HOME/Library/LaunchAgents/com.agents-serve.hermes.plist" ]; then
+    warn "removing legacy com.agents-serve.hermes LaunchAgent (superseded by hermes gateway install)"
+    launchctl unload "$HOME/Library/LaunchAgents/com.agents-serve.hermes.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.agents-serve.hermes.plist"
+  fi
 }
 
-install_hermes_linux() {
-  local unit="$HOME/.config/systemd/user/hermes-serve.service"
-  local log="$HOME/.cache/hermes-serve/serve.log"
-  mkdir -p "$(dirname "$unit")" "$(dirname "$log")"
-
-  fetch "templates/hermes-serve.service" \
-    | sed -e "s|__WRAPPER__|$BIN_DIR/hermes-serve|g" -e "s|__LOG__|$log|g" > "$unit"
-  say "unit installed -> $unit"
-
-  systemctl --user daemon-reload
-  systemctl --user reset-failed hermes-serve.service 2>/dev/null || true
-  systemctl --user enable hermes-serve.service
-  systemctl --user restart hermes-serve.service
-  loginctl enable-linger "${USER:-$(id -un)}" >/dev/null 2>&1 || true
-  say "hermes service started (systemd --user)"
-}
-
-install_hermes_macos() {
-  local plist="$HOME/Library/LaunchAgents/com.agents-serve.hermes.plist"
-  local log="$HOME/Library/Logs/hermes-serve.log"
-  mkdir -p "$(dirname "$plist")" "$(dirname "$log")"
-
-  fetch "templates/com.agents-serve.hermes.plist" \
-    | sed -e "s|__WRAPPER__|$BIN_DIR/hermes-serve|g" -e "s|__LOG__|$log|g" > "$plist"
-  say "plist installed -> $plist"
-
-  launchctl unload "$plist" 2>/dev/null || true
-  launchctl load -w "$plist"
-  say "hermes service started (launchd)"
+install_hermes_service() {
+  # `hermes gateway install` is Hermes' own service manager: systemd --user on
+  # Linux, launchd on macOS. It knows its restart policy, stop hooks and
+  # ExecReload; a hand-written unit only drifts from that.
+  #
+  # Note: Hermes does NOT provide a service for `hermes dashboard` (upstream
+  # docs: "Hermes never installs a service for `hermes dashboard` or
+  # `hermes serve`"), so this installer deliberately leaves the dashboard
+  # alone rather than inventing a unit for it.
+  if ! command -v hermes >/dev/null 2>&1; then
+    warn "hermes CLI not found — skipping gateway service install"
+    return 1
+  fi
+  if hermes gateway install; then
+    say "hermes gateway installed (native service)"
+  else
+    warn "hermes gateway install failed — run 'hermes doctor' (or 'hermes pm repair') and retry"
+    return 1
+  fi
 }
 
 print_hermes_info() {
-  local host port
-  port="${HERMES_SERVE_PORT:-9119}"
-  host="$(resolved_host_preview "${HERMES_SERVE_HOST:-}")"
   echo
-  say "Hermes server:"
-  printf '    URL:  http://%s:%s\n' "${host:-<tailnet-ip>}" "$port"
+  say "Hermes gateway (native service):"
+  printf '    Status: hermes gateway status\n'
   if [ "$OS" = "Linux" ]; then
-    printf '    Logs: journalctl --user -u hermes-serve -f  (or ~/.cache/hermes-serve/serve.log)\n'
+    printf '    Logs:   journalctl --user -u hermes-gateway -f\n'
   else
-    printf '    Logs: ~/Library/Logs/hermes-serve.log\n'
+    printf '    Logs:   ~/.hermes/logs/gateway.log\n'
   fi
-  warn "hermes: binding to a non-loopback host requires auth to be configured (password or OAuth) — run 'hermes dashboard register' if you haven't. --insecure is a deprecated no-op."
 }
 
 install_hermes() {
   say "== hermes =="
   install_hermes_upstream
   install_hermes_wrapper
-  case "$OS" in
-    Linux)  install_hermes_linux ;;
-    Darwin) install_hermes_macos ;;
-  esac
+  install_hermes_service
   print_hermes_info
+}
+
+# ------------------------------------------------------------------ openclaw --
+# OpenClaw serves its dashboard (the Control UI) from the gateway itself, and
+# ships its own service manager, so there is nothing to wrap: configure the
+# gateway in openclaw.json, then let `openclaw gateway install` own the unit.
+install_openclaw_upstream() {
+  if command -v openclaw >/dev/null 2>&1 || [ -x "$HOME/.local/bin/openclaw" ]; then
+    say "openclaw present"
+    return
+  fi
+  say "installing openclaw via upstream installer"
+  curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
+}
+
+find_openclaw() {
+  if command -v openclaw >/dev/null 2>&1; then command -v openclaw; return; fi
+  local p
+  for p in "$HOME/.local/bin/openclaw" "$HOME/.openclaw/bin/openclaw" \
+           /usr/local/bin/openclaw /opt/homebrew/bin/openclaw; do
+    if [ -x "$p" ]; then printf '%s' "$p"; return; fi
+  done
+  return 1
+}
+
+# Never rotate a password that already works: only append when the key is
+# absent. OpenClaw loads ~/.openclaw/.env itself, so the native unit needs no
+# EnvironmentFile and no wrapper to see it.
+ensure_openclaw_password() {
+  local env_file="$HOME/.openclaw/.env"
+  mkdir -p "$(dirname "$env_file")"
+  if [ -f "$env_file" ] && grep -q '^OPENCLAW_GATEWAY_PASSWORD=' "$env_file" 2>/dev/null; then
+    say "openclaw gateway password already set in $env_file"
+    return 0
+  fi
+  local pw
+  pw="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+  ( umask 177; printf 'OPENCLAW_GATEWAY_PASSWORD=%s\n' "$pw" >> "$env_file" )
+  say "generated OPENCLAW_GATEWAY_PASSWORD in $env_file"
+}
+
+# Print the proxy target currently published on HTTPS :443, if any. OpenClaw's
+# managed Funnel always claims :443 and refuses to start when another route
+# owns it, so the caller needs to know before flipping the mode on.
+funnel_443_target() {
+  tailscale funnel status 2>/dev/null | awk '
+    /^https:\/\/[^:]+ \(Funnel on\)$/ { block = 1; next }
+    /^https:\/\// { block = 0 }
+    block && /proxy/ { print $NF; exit }
+  '
+}
+
+install_openclaw_funnel() {
+  local oc="$1" port="$2"
+  if [ "${OPENCLAW_SERVE_PUBLIC:-0}" != "1" ]; then
+    "$oc" config set gateway.tailscale.mode off >/dev/null 2>&1 || true
+    return 0
+  fi
+  if ! command -v tailscale >/dev/null 2>&1; then
+    warn "tailscale CLI not found — openclaw stays loopback-only"
+    return 0
+  fi
+  local target
+  target="$(funnel_443_target || true)"
+  if [ -n "$target" ] && [ "$target" != "http://127.0.0.1:$port" ]; then
+    warn "HTTPS :443 is already published to $target — not enabling openclaw's managed Funnel (it would fail to start). Free :443 and re-run with OPENCLAW_SERVE_PUBLIC=1."
+    "$oc" config set gateway.tailscale.mode off >/dev/null 2>&1 || true
+    return 0
+  fi
+  "$oc" config set gateway.tailscale.mode funnel >/dev/null
+  say "openclaw managed Funnel enabled (public HTTPS on :443, password auth required)"
+}
+
+install_openclaw() {
+  say "== openclaw =="
+  install_openclaw_upstream
+  local oc port bind
+  if ! oc="$(find_openclaw)"; then
+    warn "openclaw binary not found after install"
+    return 1
+  fi
+  port="${OPENCLAW_SERVE_PORT:-18789}"
+  bind="${OPENCLAW_SERVE_BIND:-loopback}"
+
+  ensure_openclaw_password
+
+  # Config, not flags: `openclaw gateway install` bakes no bind/auth flags into
+  # the unit — the gateway reads all of this from openclaw.json on every start.
+  "$oc" config set gateway.bind "$bind" >/dev/null
+  "$oc" config set gateway.port "$port" >/dev/null
+  "$oc" config set gateway.auth.mode password >/dev/null
+
+  install_openclaw_funnel "$oc" "$port"
+
+  say "installing the gateway as OpenClaw's own service (openclaw gateway install)"
+  if ! "$oc" gateway install --port "$port" --force; then
+    warn "openclaw gateway install failed — check 'openclaw doctor'"
+    return 1
+  fi
+  say "openclaw gateway installed (native service)"
+  print_openclaw_info "$oc" "$port" "$bind"
+}
+
+print_openclaw_info() {
+  local oc="$1" port="$2" bind="$3" origin=""
+  echo
+  say "OpenClaw gateway + dashboard (native service):"
+  if [ "${OPENCLAW_SERVE_PUBLIC:-0}" = "1" ]; then
+    origin="$("$oc" config get gateway.publicOrigin 2>/dev/null | tr -d '"' || true)"
+    case "$origin" in
+      https://*) : ;;
+      *) origin="https://$(tailscale status --json 2>/dev/null \
+           | grep -o '"DNSName": *"[^"]*"' | head -n1 | cut -d'"' -f4 | sed 's/\.$//')" ;;
+    esac
+  fi
+  if [ -n "$origin" ] && [ "$origin" != "https://" ]; then
+    printf '    URL:      %s (managed Funnel, public HTTPS)\n' "$origin"
+  else
+    printf '    URL:      http://127.0.0.1:%s (bind=%s)\n' "$port" "$bind"
+  fi
+  printf '    Password: OPENCLAW_GATEWAY_PASSWORD in %s/.openclaw/.env\n' "$HOME"
+  printf '    Status:   openclaw gateway status\n'
+  if [ "$OS" = "Linux" ]; then
+    printf '    Logs:     journalctl --user -u openclaw-gateway -f\n'
+  else
+    printf '    Logs:     ~/Library/Logs/openclaw-gateway.log\n'
+  fi
 }
 
 # ----------------------------------------------------------------- dispatch --
@@ -381,7 +516,7 @@ install_hermes() {
 # on an unknown name. Prints one service name per line.
 expand_services() {
   if [ "$#" -eq 0 ]; then
-    printf 'opencode\npaperclip\nhermes\n'
+    printf 'opencode\npaperclip\nhermes\nopenclaw\n'
     return
   fi
   local name want_all=0
@@ -389,13 +524,13 @@ expand_services() {
     [ "$name" = "all" ] && want_all=1
   done
   if [ "$want_all" -eq 1 ]; then
-    printf 'opencode\npaperclip\nhermes\n'
+    printf 'opencode\npaperclip\nhermes\nopenclaw\n'
     return
   fi
   for name in "$@"; do
     case "$name" in
-      opencode|paperclip|hermes) printf '%s\n' "$name" ;;
-      *) die "unknown service '$name' — valid: opencode paperclip hermes all" ;;
+      opencode|paperclip|hermes|openclaw) printf '%s\n' "$name" ;;
+      *) die "unknown service '$name' — valid: opencode paperclip hermes openclaw all" ;;
     esac
   done
 }
