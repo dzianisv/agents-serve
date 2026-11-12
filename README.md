@@ -265,6 +265,7 @@ loopback fallback so paperclip keeps its own `local_trusted` default.
 | `OPENCLAW_SERVE_PORT`  | `18789`     | Gateway port (written to `gateway.port`)                        |
 | `OPENCLAW_SERVE_BIND`  | `loopback`  | `gateway.bind`: `loopback`, `tailnet`, `lan`, `auto`, `custom`  |
 | `OPENCLAW_SERVE_PUBLIC`| `0`         | Set to `1` to enable OpenClaw's managed Funnel (public HTTPS `:443`) |
+| `OPENCLAW_SERVE_NODE`  | auto        | Override Node executable pinned into the native service; auto-detects Node 24.16+ / 26.1+ |
 
 ### hermes
 

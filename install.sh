@@ -407,6 +407,39 @@ find_openclaw() {
   return 1
 }
 
+# OpenClaw needs Node 24.16+ (24.x) or 26.1+ (26.x). Pinning an older system
+# node into the unit produces a service that crash-loops on boot, so resolve a
+# supported runtime and pass it as --runtime-path.
+node_supports_openclaw() {
+  local v major minor
+  v="$("$1" -v 2>/dev/null | sed 's/^v//')"
+  [ -n "$v" ] || return 1
+  major="${v%%.*}"
+  minor="${v#*.}"; minor="${minor%%.*}"
+  case "$major" in
+    24) [ "${minor:-0}" -ge 16 ] 2>/dev/null ;;
+    26) [ "${minor:-0}" -ge 1 ] 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_openclaw_node() {
+  if [ -n "${OPENCLAW_SERVE_NODE:-}" ]; then
+    printf '%s' "$OPENCLAW_SERVE_NODE"
+    return 0
+  fi
+  local n
+  n="$(command -v node 2>/dev/null || true)"
+  if [ -n "$n" ] && node_supports_openclaw "$n"; then printf '%s' "$n"; return 0; fi
+  # Fall back to a runtime another agent already provisioned on this host
+  # (e.g. hermes ships its own Node under ~/.hermes/tools). Newest wins.
+  for n in $(ls -1d "$HOME"/.hermes/tools/node-*/bin/node "$HOME"/.openclaw/*/bin/node 2>/dev/null | sort -Vr); do
+    [ -x "$n" ] || continue
+    if node_supports_openclaw "$n"; then printf '%s' "$n"; return 0; fi
+  done
+  return 1
+}
+
 # Never rotate a password that already works: only append when the key is
 # absent. OpenClaw loads ~/.openclaw/.env itself, so the native unit needs no
 # EnvironmentFile and no wrapper to see it.
@@ -476,12 +509,24 @@ install_openclaw() {
 
   install_openclaw_funnel "$oc" "$port"
 
+  local node=""
+  node="$(resolve_openclaw_node || true)"
+  if [ -z "$node" ]; then
+    warn "no Node >= 24.16 / 26.1 found — letting openclaw pick its own runtime. Install a supported Node and re-run to pin it (OPENCLAW_SERVE_NODE overrides)."
+  fi
+
   say "installing the gateway as OpenClaw's own service (openclaw gateway install)"
-  if ! "$oc" gateway install --port "$port" --force; then
+  local rc=0
+  if [ -n "$node" ]; then
+    "$oc" gateway install --port "$port" --force --runtime-path "$node" || rc=$?
+  else
+    "$oc" gateway install --port "$port" --force || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
     warn "openclaw gateway install failed — check 'openclaw doctor'"
     return 1
   fi
-  say "openclaw gateway installed (native service)"
+  say "openclaw gateway installed (native service${node:+, node: $node})"
   print_openclaw_info "$oc" "$port" "$bind"
 }
 
