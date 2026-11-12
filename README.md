@@ -4,27 +4,32 @@
 curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh | bash
 ```
 
-One-line installer that runs AI agent servers as background services,
-**auto-bound to your Tailscale tailnet IP** — no hardcoded address. Unix-agnostic:
-**systemd --user** on Linux, **launchd** on macOS. Installs all three services by
-default; pass names to install a subset.
+One-line installer that runs AI agent servers as background services.
+`opencode` and `paperclip` are bound to your **Tailscale tailnet IP** (no
+hardcoded address); `hermes` and `openclaw` are installed through their **own
+native service managers**, because upstream already ships one — this repo does
+not hand-roll a competing unit for them. Unix-agnostic: **systemd --user** on
+Linux, **launchd** on macOS. Installs all four services by default; pass names
+to install a subset.
 
 ## Services
 
-| Service     | What it is                                   | Default port | Upstream install                                                                    | Auth notes |
-| ----------- | --------------------------------------------- | ------------- | ------------------------------------------------------------------------------------ | ---------- |
-| `opencode`  | [OpenCode](https://opencode.ai) headless server | `4096`        | `@opencode/cli` (mainstream v2) via npm, else `curl -fsSL https://opencode.ai/v2/install \| bash` | Server password + token, generated locally |
-| `paperclip` | [Paperclip](https://paperclip.ing) AI agent server | `3100`        | `curl -fsSL https://paperclip.ing/install.sh \| bash -s -- --no-prompt --no-onboard`   | Tailnet bind forces `authenticated`+`private` mode; JWT secret auto-generated locally |
-| `hermes`    | [Hermes](https://github.com/NousResearch/hermes-agent) AI agent server | `9119`        | `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash` | **Requires auth configured** for non-loopback binds (see below) |
+| Service     | What it is                                   | Default port | Upstream install                                                                    | Service unit | Auth notes |
+| ----------- | --------------------------------------------- | ------------ | ------------------------------------------------------------------------------------ | ------------ | ---------- |
+| `opencode`  | [OpenCode](https://opencode.ai) headless server | `4096`       | `@opencode/cli` (mainstream v2) via npm, else `curl -fsSL https://opencode.ai/v2/install \| bash` | **this repo** (`opencode-serve.service`) — upstream has no service support | Server password + token, generated locally |
+| `paperclip` | [Paperclip](https://paperclip.ing) AI agent server | `3100`     | `curl -fsSL https://paperclip.ing/install.sh \| bash -s -- --no-prompt --no-onboard`   | **this repo** (`paperclip-serve.service`) — upstream has no service support | Tailnet bind forces `authenticated`+`private` mode; JWT secret auto-generated locally |
+| `hermes`    | [Hermes](https://github.com/NousResearch/hermes-agent) messaging gateway | — | `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash` | **native** (`hermes gateway install`) | Hermes manages its own auth |
+| `openclaw`  | [OpenClaw](https://openclaw.ai) gateway + web dashboard (Control UI) | `18789` | `curl -fsSL https://openclaw.ai/install.sh \| bash -s -- --no-onboard` | **native** (`openclaw gateway install`) | Password auth (`OPENCLAW_GATEWAY_PASSWORD`); required before any public Funnel |
 
-Each installed service is reachable at `http://<tailnet-ip>:<port>` once the
-node is on your tailnet — no manual IP configuration needed.
+`opencode` and `paperclip` are reachable at `http://<tailnet-ip>:<port>` once
+the node is on your tailnet. `hermes` and `openclaw` follow whatever their own
+service managers do — see [Native service managers](#native-service-managers-hermes--openclaw).
 
 For the Hermes **browser dashboard** on a public HTTPS URL (loopback bind +
 password auth + Tailscale Funnel), use the standalone installer in
 [Hermes dashboard over Tailscale Funnel](#hermes-dashboard-over-tailscale-funnel).
-It is not part of `install.sh`, and it shares port `9119` with the `hermes`
-service.
+It is not part of `install.sh`; its dashboard listener uses port `9119` by
+default. Use `--port` if that port is already occupied.
 
 For the **OpenClaw Control UI** on a public HTTPS URL (loopback bind + gateway
 password auth + Tailscale Funnel), use
@@ -43,13 +48,17 @@ curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.
 
 # install a subset
 curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh | bash -s -- paperclip hermes
+
+# install openclaw only, and publish its dashboard publicly over HTTPS
+OPENCLAW_SERVE_PUBLIC=1 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/install.sh) -s -- openclaw
 ```
 
-Valid names: `opencode`, `paperclip`, `hermes`, `all` (default when no args are
-given). An unknown name aborts immediately with the valid list. Each service is
-installed independently — if one fails (e.g. its upstream installer is down),
-the others still proceed; the script reports a warning per failure and exits
-non-zero at the end if anything failed.
+Valid names: `opencode`, `paperclip`, `hermes`, `openclaw`, `all` (default when
+no args are given). An unknown name aborts immediately with the valid list. Each
+service is installed independently — if one fails (e.g. its upstream installer
+is down), the others still proceed; the script reports a warning per failure and
+exits non-zero at the end if anything failed.
 
 > **Fork migration:** older versions of this installer installed the
 > `@vibetechnologies/opencode` fork. The installer now installs mainstream
@@ -63,21 +72,25 @@ The installer, per service:
 
 1. Installs the upstream binary if missing (skipped if already on `PATH` / in
    its known install location).
-2. Drops the service's `bin/<name>-serve` wrapper into `~/.local/bin` (plus
-   `opencode-cli` and `opencode-session-offload` for `opencode`).
-3. Installs the shared `lib/tailnet.sh` helper library to
+2. **opencode / paperclip only:** drops the service's `bin/<name>-serve` wrapper
+   into `~/.local/bin` (plus `opencode-cli` and `opencode-session-offload` for
+   `opencode`) and installs the shared `lib/tailnet.sh` helper library to
    `~/.local/lib/agents-serve/tailnet.sh`.
-4. Installs and (re)starts the service:
-   - **Linux** → `~/.config/systemd/user/<name>-serve.service` (enables linger
-     so it survives logout).
-   - **macOS** → `~/Library/LaunchAgents/com.agents-serve.<name>.plist`.
+3. Installs and (re)starts the service:
+   - **opencode / paperclip** — this repo owns the unit:
+     - **Linux** → `~/.config/systemd/user/<name>-serve.service` (enables linger
+       so it survives logout).
+     - **macOS** → `~/Library/LaunchAgents/com.agents-serve.<name>.plist`.
+   - **hermes / openclaw** — delegates to the native service manager:
+     - `hermes gateway install` (systemd --user / launchd)
+     - `openclaw gateway install` (systemd --user / launchd)
 
 ## How tailnet binding works
 
-Each wrapper (`opencode-serve`, `paperclip-serve`, `hermes-serve`) is the single
-source of truth for its own bind host, and shares one resolution routine from
-`lib/tailnet.sh`. It's resolved **at every start**, so the server always follows
-the node's current Tailscale IP:
+`opencode-serve` and `paperclip-serve` are the single source of truth for their
+own bind host, and share one resolution routine from `lib/tailnet.sh`. It's
+resolved **at every start**, so the server always follows the node's current
+Tailscale IP:
 
 ```
 <service>_SERVE_HOST  ->  AGENTS_SERVE_HOST  ->  tailscale ip -4  ->  scan iface for 100.64.0.0/10  ->  127.0.0.1
@@ -87,10 +100,13 @@ Restart to rebind after the tailnet IP changes:
 
 ```bash
 # Linux
-systemctl --user restart opencode-serve      # or paperclip-serve / hermes-serve
+systemctl --user restart opencode-serve      # or paperclip-serve
 # macOS
-launchctl kickstart -k gui/$(id -u)/com.agents-serve.opencode   # or .paperclip / .hermes
+launchctl kickstart -k gui/$(id -u)/com.agents-serve.opencode   # or .paperclip
 ```
+
+`hermes` and `openclaw` do not use this helper: they own their bind settings
+(`hermes gateway`, `gateway.bind` in `openclaw.json`) and their own units.
 
 ### Why `paperclip-serve` resolves the IP itself
 
@@ -126,14 +142,62 @@ persists it to `~/.paperclip-serve/env` (mode 600), the same idiom
 `opencode-serve` uses for its own secrets. An operator-supplied
 `PAPERCLIP_AGENT_JWT_SECRET` always takes precedence over the generated one.
 
-### Hermes non-loopback auth requirement
+### Native service managers (hermes / openclaw)
 
-As of the June 2026 Hermes hardening, binding to any **non-loopback** host
-requires an auth provider to be configured (password or OAuth) —
-`--insecure` is a deprecated no-op. If you haven't configured auth yet, run
-`hermes dashboard register` (or set up OAuth) *before* relying on the
-tailnet-bound service, or `hermes serve` will refuse to start. The installer
-prints this reminder after setting up the service.
+Both agents already ship a service manager, so this installer never writes a
+unit for them — a hand-written unit drifts from upstream (restart policy, stop
+hooks, `ExecReload`) and leaves two owners for one process.
+
+```bash
+hermes gateway install        # systemd --user / launchd, owned by hermes
+openclaw gateway install      # systemd --user / launchd, owned by openclaw
+```
+
+Consequences worth knowing:
+
+- **Hermes dashboard is separate from its gateway.** Upstream does not provide
+  a service for `hermes dashboard` or `hermes serve`; the default installer
+  leaves it alone. The optional dashboard Funnel helper is documented
+  separately and manages that distinct dashboard process.
+- **OpenClaw's dashboard *is* the gateway.** The Control UI is served by the
+  gateway process on the same port, so `openclaw gateway install` is all that
+  is needed for a persistent dashboard.
+- **OpenClaw config, not flags.** `openclaw gateway install` bakes no bind/auth
+  flags into the unit; the gateway reads them from `~/.openclaw/openclaw.json`
+  on every start. The installer sets:
+
+  ```bash
+  openclaw config set gateway.bind loopback        # OPENCLAW_SERVE_BIND overrides
+  openclaw config set gateway.port 18789           # OPENCLAW_SERVE_PORT overrides
+  openclaw config set gateway.auth.mode password
+  ```
+
+  and appends `OPENCLAW_GATEWAY_PASSWORD` to `~/.openclaw/.env` (mode 600) only
+  when the key is missing — an existing password is never rotated. OpenClaw
+  loads that file itself, so the native unit needs no `EnvironmentFile`.
+
+### OpenClaw public dashboard (Tailscale Funnel)
+
+Set `OPENCLAW_SERVE_PUBLIC=1` to enable OpenClaw's **managed** Funnel — it
+claims `https://<host>.<tailnet>.ts.net` (HTTPS `:443`), publishes the origin
+itself, and releases the route when the gateway stops.
+
+OpenClaw refuses `gateway.tailscale.mode=funnel` unless password auth is
+configured, which is exactly why the installer provisions the password first.
+
+Two hard limits:
+
+- **Funnel is always `:443`.** There is no port setting
+  (`gateway.tailscale` exposes only `mode`). If another route already owns
+  `:443`, the gateway will not start, so the installer detects that and leaves
+  the Funnel mode off with a warning instead of breaking the gateway.
+- **Funnel must be enabled for the tailnet** (admin console → DNS → HTTPS
+  certificates + funnel node attribute).
+
+If you need a second public dashboard on the same host, the second one has to
+use a hand-managed route (`tailscale funnel --bg --https 8443 http://127.0.0.1:<port>`)
+plus matching `gateway.publicOrigin` / `gateway.controlUi.allowedOrigins` —
+OpenClaw's managed Funnel cannot share `:443`.
 
 ## Configuration
 
@@ -141,7 +205,7 @@ prints this reminder after setting up the service.
 
 | Env var             | Default             | Purpose                                            |
 | -------------------- | -------------------- | --------------------------------------------------- |
-| `AGENTS_SERVE_HOST`  | auto (tailnet IP)    | Force a bind host for all services (lowest-priority override, per-service vars win) |
+| `AGENTS_SERVE_HOST`  | auto (tailnet IP)    | Force a bind host for opencode/paperclip (lowest-priority override, per-service vars win) |
 | `AGENTS_SERVE_RAW`   | this repo's `main`   | Raw base URL to fetch files when piped              |
 | `OPENCODE_SERVE_RAW` | —                    | Back-compat alias for `AGENTS_SERVE_RAW`             |
 | `PREFIX`             | `~/.local`           | Install prefix for wrappers + shared lib             |
@@ -206,12 +270,19 @@ address.
 \* Only set/defaulted when a tailnet host is resolved; left untouched on the
 loopback fallback so paperclip keeps its own `local_trusted` default.
 
+### openclaw
+
+| Env var                | Default     | Purpose                                                        |
+| ---------------------- | ----------- | -------------------------------------------------------------- |
+| `OPENCLAW_SERVE_PORT`  | `18789`     | Gateway port (written to `gateway.port`)                        |
+| `OPENCLAW_SERVE_BIND`  | `loopback`  | `gateway.bind`: `loopback`, `tailnet`, `lan`, `auto`, `custom`  |
+| `OPENCLAW_SERVE_PUBLIC`| `0`         | Set to `1` to enable OpenClaw's managed Funnel (public HTTPS `:443`) |
+| `OPENCLAW_SERVE_NODE`  | auto        | Override Node executable pinned into the native service; auto-detects Node 24.16+ / 26.1+ |
+
 ### hermes
 
-| Env var              | Default            | Purpose                     |
-| --------------------- | ------------------- | ----------------------------- |
-| `HERMES_SERVE_HOST`  | auto (tailnet IP)   | Force a specific bind host    |
-| `HERMES_SERVE_PORT`  | `9119`              | Listen port                   |
+No env vars: the gateway is configured by Hermes itself (`hermes gateway`,
+`~/.hermes/config.yaml`). This repo only runs `hermes gateway install`.
 
 Set persistently for a service:
 
@@ -342,12 +413,9 @@ Prerequisites:
 ## Secrets
 
 `opencode-serve` and `paperclip-serve` each generate their own secrets once and
-persist them locally (mode 600); `hermes-serve` manages its own auth outside
-this repo's control. The Hermes dashboard installer generates a basic-auth
-password and writes it to `~/.hermes/dashboard-funnel.env` (mode 600). The
-OpenClaw dashboard installer generates a gateway password and writes it to
-`~/.openclaw/dashboard-funnel.env` (mode 600), with the same value in
-`~/.openclaw/.env` so the Gateway can resolve it at startup.
+persist them locally (mode 600). Hermes and OpenClaw gateway authentication is
+managed by their upstream CLIs. The optional dashboard Funnel helpers also
+persist their access details locally, mode 600.
 
 | File                          | Contents                                    |
 | ------------------------------ | -------------------------------------------- |
@@ -356,29 +424,32 @@ OpenClaw dashboard installer generates a gateway password and writes it to
 | `~/.paperclip-serve/env`       | `PAPERCLIP_AGENT_JWT_SECRET=<base64url 32B>` |
 | `~/.hermes/dashboard-funnel.env` | dashboard public URL + basic-auth password |
 | `~/.openclaw/dashboard-funnel.env` | OpenClaw public URL + gateway password |
-| `~/.openclaw/.env`             | `OPENCLAW_GATEWAY_PASSWORD=<generated>`     |
+| `~/.openclaw/.env`             | `OPENCLAW_GATEWAY_PASSWORD=<generated once>` (OpenClaw's own file) |
 
 Generated once via `openssl rand -base64 32` (URL-safe). Delete them and
-restart the service to rotate.
+restart the service to rotate. For OpenClaw, change the password in
+`~/.openclaw/.env` and run `openclaw gateway restart`.
 
 ## Logs
 
-| OS    | opencode                                                    | paperclip                                                  | hermes                                                  |
-| ----- | ------------------------------------------------------------ | ------------------------------------------------------------ | ---------------------------------------------------------- |
-| Linux | `journalctl --user -u opencode-serve -f` (or `~/.cache/opencode-serve/serve.log`) | `journalctl --user -u paperclip-serve -f` (or `~/.cache/paperclip-serve/serve.log`) | `journalctl --user -u hermes-serve -f` (or `~/.cache/hermes-serve/serve.log`) |
-| macOS | `tail -f ~/Library/Logs/opencode-serve.log`                  | `tail -f ~/Library/Logs/paperclip-serve.log`                 | `tail -f ~/Library/Logs/hermes-serve.log`                  |
+| OS    | opencode                                                    | paperclip                                                  | hermes                          | openclaw                          |
+| ----- | ------------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------- | ---------------------------------- |
+| Linux | `journalctl --user -u opencode-serve -f` (or `~/.cache/opencode-serve/serve.log`) | `journalctl --user -u paperclip-serve -f` (or `~/.cache/paperclip-serve/serve.log`) | `journalctl --user -u hermes-gateway -f` | `journalctl --user -u openclaw-gateway -f` |
+| macOS | `tail -f ~/Library/Logs/opencode-serve.log`                  | `tail -f ~/Library/Logs/paperclip-serve.log`                 | `~/.hermes/logs/gateway.log`     | `openclaw gateway status` / `~/Library/Logs/openclaw-gateway.log` |
 
 ## Service management cheat-sheet
 
-| Action        | Linux (systemd --user)                          | macOS (launchd)                                                        |
-| -------------- | -------------------------------------------------- | -------------------------------------------------------------------------- |
-| Status         | `systemctl --user status opencode-serve`           | `launchctl list \| grep com.agents-serve.opencode`                       |
-| Restart        | `systemctl --user restart opencode-serve`          | `launchctl kickstart -k gui/$(id -u)/com.agents-serve.opencode`           |
-| Stop           | `systemctl --user stop opencode-serve`             | `launchctl unload ~/Library/LaunchAgents/com.agents-serve.opencode.plist` |
-| Follow logs    | `journalctl --user -u opencode-serve -f`           | `tail -f ~/Library/Logs/opencode-serve.log`                               |
+| Action        | opencode / paperclip (this repo)                | hermes / openclaw (native)     |
+| -------------- | -------------------------------------------------- | ------------------------------ |
+| Status         | `systemctl --user status opencode-serve`           | `hermes gateway status` / `openclaw gateway status` |
+| Restart        | `systemctl --user restart opencode-serve`          | `hermes gateway restart` / `openclaw gateway restart` |
+| Stop           | `systemctl --user stop opencode-serve`             | `hermes gateway stop` / `openclaw gateway stop` |
+| Follow logs    | `journalctl --user -u opencode-serve -f`           | `journalctl --user -u hermes-gateway -f` / `-u openclaw-gateway` |
 
-Swap `opencode` for `paperclip` / `hermes` (unit names: `paperclip-serve`,
-`hermes-serve`; labels: `com.agents-serve.paperclip`, `com.agents-serve.hermes`).
+On macOS, opencode/paperclip use launchd
+(`launchctl kickstart -k gui/$(id -u)/com.agents-serve.opencode`,
+`launchctl unload ~/Library/LaunchAgents/com.agents-serve.opencode.plist`);
+hermes/openclaw keep using the same CLI verbs above.
 
 ## Remote CLI (opencode)
 
@@ -429,8 +500,9 @@ curl -fsSL https://raw.githubusercontent.com/dzianisv/agents-serve/main/uninstal
 ```
 
 `--purge` only deletes `~/.opencode-serve` (the secrets this installer itself
-generates). It never touches paperclip's `$PAPERCLIP_HOME` or hermes' own data
-— those are managed by their upstream tools, not by this repo.
+generates). `hermes` and `openclaw` are removed through their own service
+managers (`hermes gateway uninstall`, `openclaw gateway uninstall`), and their
+data (`~/.hermes`, `~/.openclaw`) is never touched.
 
 ## Layout
 
@@ -438,19 +510,20 @@ generates). It never touches paperclip's `$PAPERCLIP_HOME` or hermes' own data
 agents-serve/
 ├── install.sh                            # entry point (Linux + macOS), accepts service names
 ├── uninstall.sh                           # accepts the same service names
-├── lib/tailnet.sh                         # shared tailnet-IP resolution, secrets, logging
+├── lib/tailnet.sh                         # shared tailnet-IP resolution, secrets, logging (opencode/paperclip)
 ├── bin/opencode-serve                     # opencode wrapper: tailnet bind + secrets + exec opencode serve
 ├── bin/opencode-cli                       # remote session lister + permission listener
 ├── bin/opencode-session-offload           # local session archive wrapper
 ├── bin/paperclip-serve                    # paperclip wrapper: tailnet bind + exec paperclipai run
-├── bin/hermes-serve                       # hermes wrapper: tailnet bind + exec hermes serve
 ├── bin/hermes-dashboard-funnel            # standalone: loopback dashboard + auth + Tailscale Funnel
 ├── bin/openclaw-dashboard-funnel          # standalone: OpenClaw Control UI + gateway password + Funnel
-└── templates/
+└── templates/                             # units only for services without native managers
     ├── opencode-serve.service             # systemd --user unit (opencode)
     ├── com.agents-serve.opencode.plist    # launchd LaunchAgent (opencode)
     ├── paperclip-serve.service            # systemd --user unit (paperclip)
-    ├── com.agents-serve.paperclip.plist   # launchd LaunchAgent (paperclip)
-    ├── hermes-serve.service               # systemd --user unit (hermes)
-    └── com.agents-serve.hermes.plist      # launchd LaunchAgent (hermes)
+    └── com.agents-serve.paperclip.plist   # launchd LaunchAgent (paperclip)
 ```
+
+No Hermes gateway or OpenClaw wrapper/unit template exists on purpose: both
+agents ship their own gateway service managers. The dashboard Funnel helpers
+are separate tools; see their sections above for their behavior.

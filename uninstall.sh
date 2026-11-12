@@ -9,15 +9,20 @@
 #                                      # generated secrets in ~/.opencode-serve
 #   uninstall.sh opencode --purge     # remove one + purge its secrets
 #
-# paperclip and hermes manage their own app data outside this repo's control
-# (e.g. paperclip's $PAPERCLIP_HOME, default ~/.paperclip) — --purge never
-# touches that, only the opencode secrets this installer itself generates.
+# hermes and openclaw are removed through their own service managers
+# (`hermes gateway uninstall`, `openclaw gateway uninstall`); their app data
+# lives outside this repo's control (e.g. ~/.hermes, ~/.openclaw) — --purge
+# never touches it, only the opencode secrets this installer itself generates.
 set -euo pipefail
 
 OS="$(uname -s)"
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 LIB_DIR="$PREFIX/lib/agents-serve"
+
+# Piped invocations inherit a minimal PATH. The native agent CLIs commonly
+# live in ~/.local/bin, so make them discoverable for their own uninstallers.
+export PATH="$BIN_DIR:$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -37,7 +42,7 @@ done
 # via $SERVICE_ARGS at the call site (word-split on purpose).
 expand_services() {
   if [ "$#" -eq 0 ]; then
-    printf 'opencode\npaperclip\nhermes\n'
+    printf 'opencode\npaperclip\nhermes\nopenclaw\n'
     return
   fi
   local name want_all=0
@@ -45,13 +50,13 @@ expand_services() {
     [ "$name" = "all" ] && want_all=1
   done
   if [ "$want_all" -eq 1 ]; then
-    printf 'opencode\npaperclip\nhermes\n'
+    printf 'opencode\npaperclip\nhermes\nopenclaw\n'
     return
   fi
   for name in "$@"; do
     case "$name" in
-      opencode|paperclip|hermes) printf '%s\n' "$name" ;;
-      *) die "unknown service '$name' — valid: opencode paperclip hermes all" ;;
+      opencode|paperclip|hermes|openclaw) printf '%s\n' "$name" ;;
+      *) die "unknown service '$name' — valid: opencode paperclip hermes openclaw all" ;;
     esac
   done
 }
@@ -106,6 +111,12 @@ uninstall_paperclip() {
 }
 
 uninstall_hermes() {
+  # Hermes owns its unit: `hermes gateway uninstall` removes it. The
+  # hermes-serve wrapper + unit this repo used to install are legacy — clear
+  # them too so an old install cannot keep the port.
+  if command -v hermes >/dev/null 2>&1; then
+    hermes gateway uninstall 2>/dev/null || warn "hermes gateway uninstall failed — check 'hermes gateway status'"
+  fi
   case "$OS" in
     Linux)
       systemctl --user disable --now hermes-serve.service 2>/dev/null || true
@@ -119,9 +130,27 @@ uninstall_hermes() {
       ;;
   esac
   rm -f "$BIN_DIR/hermes-serve"
-  say "removed hermes service + wrapper"
+  say "removed hermes gateway service (native) + legacy wrapper"
   if [ "$PURGE" -eq 1 ]; then
     say "hermes manages its own data outside this repo's control — not touched by --purge"
+  fi
+}
+
+uninstall_openclaw() {
+  # OpenClaw owns its unit: `openclaw gateway uninstall` removes it.
+  if command -v openclaw >/dev/null 2>&1; then
+    openclaw gateway uninstall 2>/dev/null || warn "openclaw gateway uninstall failed — check 'openclaw gateway status'"
+  else
+    warn "openclaw CLI not found — nothing to uninstall natively"
+  fi
+  say "removed openclaw gateway service (native)"
+  if [ "$PURGE" -eq 1 ]; then
+    # Funnel is owned by the gateway process itself and is released on stop;
+    # this only clears a route that survived a hard kill.
+    if command -v tailscale >/dev/null 2>&1; then
+      tailscale funnel --https=443 --set-path=/ off >/dev/null 2>&1 || true
+    fi
+    say "openclaw keeps its config + secrets in ~/.openclaw — not touched by --purge (remove OPENCLAW_GATEWAY_PASSWORD from ~/.openclaw/.env to revoke access)"
   fi
 }
 
@@ -146,9 +175,10 @@ main() {
 $services
 EOF
 
-  # Remove the shared lib once nothing installed by this repo remains.
-  if [ ! -x "$BIN_DIR/opencode-serve" ] && [ ! -x "$BIN_DIR/paperclip-serve" ] \
-     && [ ! -x "$BIN_DIR/hermes-serve" ]; then
+  # Remove the shared lib once nothing installed by this repo remains. Only
+  # opencode and paperclip use it — hermes and openclaw run their own native
+  # services and never source lib/tailnet.sh.
+  if [ ! -x "$BIN_DIR/opencode-serve" ] && [ ! -x "$BIN_DIR/paperclip-serve" ]; then
     rm -rf "$LIB_DIR"
   fi
 
